@@ -1,0 +1,74 @@
+field_instance,full_name,var_name
+31-0.0,Sex,sex
+34-0.0,Year of birth,year
+48-0.0,Waist circumference,waist_circumference
+49-0.0,Hip circumference,hip_circumference
+50-0.0,Standing height,standing_height
+52-0.0,Month of birth,month
+53-0.0,Date of attending assessment centre,date_of_assessment
+74-0.0,Fasting time,fasting_time
+102-0.0,Pulse rate automated reading,pulse_rate
+1239-0.0,Current tobacco smoking,smoking
+1558-0.0,Alcohol intake frequency.,alcohol
+4079-0.0,Diastolic blood pressure automated reading,dbp
+4080-0.0,Systolic blood pressure automated reading,sbp
+20150-0.0,Forced expiratory volume in 1-second (FEV1) Best measure,fev1_best
+20151-0.0,Forced vital capacity (FVC) Best measure,fvc_best
+20258-0.0,FEV1/ FVC ratio Z-score,fev1_fvc_ratio
+21001-0.0,Body mass index (BMI),bmi
+21003-0.0,Age when attended assessment centre,age_at_assessment
+30000-0.0,White blood cell (leukocyte) count,WBC
+30010-0.0,Red blood cell (erythrocyte) count,RBC
+30020-0.0,Haemoglobin concentration,hemoglobin
+30030-0.0,Haematocrit percentage,hematocrit
+30040-0.0,Mean corpuscular volume,MCV
+30050-0.0,Mean corpuscular haemoglobin,MCH
+30060-0.0,Mean corpuscular haemoglobin concentration,MCHC
+30080-0.0,Platelet count,Pc
+30100-0.0,Mean platelet (thrombocyte) volume,MPV
+30120-0.0,Lymphocyte count,LymC
+30130-0.0,Monocyte count,MonC
+30140-0.0,Neutrophill count,NeuC
+30150-0.0,Eosinophill count,EosC
+30160-0.0,Basophill count,BasC
+30170-0.0,Nucleated red blood cell count,nRBC
+30250-0.0,Reticulocyte count,RC
+30260-0.0,Mean reticulocyte volume,MRV
+30270-0.0,Mean sphered cell volume,MSCV
+30280-0.0,Immature reticulocyte fraction,IRF
+30300-0.0,High light scatter reticulocyte count,HLSRC
+30500-0.0,Microalbumin in urine,MicU
+30510-0.0,Creatinine (enzymatic) in urine,CreaU
+30520-0.0,Potassium in urine,PotU
+30530-0.0,Sodium in urine,SodU
+30600-0.0,Albumin,Alb
+30610-0.0,Alkaline phosphatase,ALP
+30620-0.0,Alanine aminotransferase,Alanine
+30630-0.0,Apolipoprotein A,ApoA
+30640-0.0,Apolipoprotein B,ApoB
+30650-0.0,Aspartate aminotransferase,AA
+30660-0.0,Direct bilirubin,DBil
+30670-0.0,Urea,Urea
+30680-0.0,Calcium,Calcium
+30690-0.0,Cholesterol,Cholesterol
+30700-0.0,Creatinine,Creatinine
+30710-0.0,C-reactive protein,CRP
+30720-0.0,Cystatin C,CystatinC
+30730-0.0,Gamma glutamyltransferase,GGT
+30740-0.0,Glucose,Glu
+30750-0.0,Glycated haemoglobin (HbA1c),HbA1c
+30760-0.0,HDL cholesterol,HDL
+30770-0.0,IGF-1,IGF1
+30780-0.0,LDL direct,LDL
+30790-0.0,Lipoprotein A,LpA
+30800-0.0,Oestradiol,Oestradiol
+30810-0.0,Phosphate,Phosphate
+30820-0.0,Rheumatoid factor,Rheu
+30830-0.0,SHBG,SHBG
+30840-0.0,Total bilirubin,TotalBil
+30850-0.0,Testosterone,Testosterone
+30860-0.0,Total protein,TotalProtein
+30870-0.0,Triglycerides,Tri
+30880-0.0,Urate,Urate
+30890-0.0,Vitamin D,VitaminD
+40000-0.0,Date of death,Death
