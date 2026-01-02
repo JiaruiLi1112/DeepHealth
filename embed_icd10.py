@@ -20,7 +20,7 @@ _LABEL_RE = re.compile(r"^\s*([A-Z][0-9][0-9][A-Z0-9]{0,2})\s*\((.+)\)\s*$")
 _CODE_RE = re.compile(r"^[A-Z][A-Z0-9]{1,6}$")
 
 
-def _read_labels(labels_path: str) -> list[Icd10Label]:
+def _read_labels(labels_path: str, *, strict_codes: bool) -> list[Icd10Label]:
     labels: list[Icd10Label] = []
     with open(labels_path, "r", encoding="utf-8") as f:
         for raw_line in f:
@@ -47,9 +47,10 @@ def _read_labels(labels_path: str) -> list[Icd10Label]:
                 if disease.startswith("(") and disease.endswith(")"):
                     disease = disease[1:-1].strip()
 
-            if not _CODE_RE.match(code):
+            if strict_codes and not _CODE_RE.match(code):
                 raise ValueError(
-                    f"Unrecognized ICD10-like code in label: {line!r} (code={code!r})."
+                    f"Unrecognized ICD10-like code in label: {line!r} (code={code!r}). "
+                    "Re-run without --strict-codes to allow non-ICD labels (e.g., 'Death')."
                 )
             labels.append(Icd10Label(code=code, disease=disease))
     if not labels:
@@ -114,9 +115,14 @@ def main() -> int:
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to run on (cuda or cpu)",
     )
+    parser.add_argument(
+        "--strict-codes",
+        action="store_true",
+        help="Fail if a label code is not ICD10-like (disallows labels like 'Death')",
+    )
     args = parser.parse_args()
 
-    labels = _read_labels(args.labels)
+    labels = _read_labels(args.labels, strict_codes=args.strict_codes)
     texts = [lbl.disease for lbl in labels]
     embs = embed_texts(
         texts,
