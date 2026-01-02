@@ -16,7 +16,7 @@ from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
 
 from dataset import HealthDataset, health_collate_fn
-from model import DelphiFork
+from model import DelphiFork, SapDelphi
 from losses import (
     ExponentialNLLLoss,
     WeibullNLLLoss,
@@ -57,6 +57,7 @@ class TrainConfig:
         trimmed_mean_trim (float): Trim fraction for trimmed-mean validation NLL.
     """
     # Model parameters
+    model_type: Literal["delphifork", "sapdelphi"] = "delphifork"
     # Options: 'exponential', 'weibull', 'lognormal'
     loss_type: Literal[
         "exponential",
@@ -70,6 +71,9 @@ class TrainConfig:
     n_head: int = 12
     pdrop: float = 0.0
     lambda_reg: float = 1e-4
+    # SapDelphi-specific parameters
+    pretrained_weights_path: str = "icd10_sapbert_embeddings.npy"
+    freeze_embeddings: bool = False
     # Data parameters
     data_prefix: str = "ukb"
     train_ratio: float = 0.7
@@ -87,8 +91,8 @@ class TrainConfig:
     weight_decay: float = 1e-2
     grad_clip: float = 1.0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    # Metrics / validation parameters
-    trimmed_mean_trim: float = 0.01
+    # EMA parameters
+    ema_decay: float = 0.999
 
 
 def parse_args() -> TrainConfig:
@@ -101,12 +105,18 @@ def parse_args() -> TrainConfig:
         default=None,
         help="Resume training from an existing run directory under runs/",
     )
+    parser.add_argument("--model_type", type=str,
+                        default="delphifork", help="Model type: delphifork or sapdelphi")
     parser.add_argument("--loss_type", type=str,
                         default="weibull", help="Type of loss function")
     parser.add_argument("--full_cov", action="store_true",
                         help="Use full covariance matrix")
     parser.add_argument("--age_encoder", type=str,
                         default="sinusoidal", help="Age encoder type")
+    parser.add_argument("--pretrained_weights_path", type=str,
+                        default="icd10_sapbert_embeddings.npy", help="Path to pretrained embeddings (SapDelphi only)")
+    parser.add_argument("--freeze_embeddings", action="store_true",
+                        help="Freeze pretrained embeddings (SapDelphi only)")
     parser.add_argument("--n_embd", type=int,
                         default=120, help="Embedding dimension")
     parser.add_argument("--n_layer", type=int,
@@ -137,12 +147,8 @@ def parse_args() -> TrainConfig:
                         default=1e-2, help="Weight decay for optimizer")
     parser.add_argument("--grad_clip", type=float,
                         default=1.0, help="Gradient clipping value")
-    parser.add_argument(
-        "--trimmed_mean_trim",
-        type=float,
-        default=0.01,
-        help="Trim fraction for trimmed-mean validation NLL (e.g., 0.1 trims 10%% on each side)",
-    )
+    parser.add_argument("--ema_decay", type=float,
+                        default=0.999, help="EMA decay rate for model parameters")
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use for training")
     args = parser.parse_args()
@@ -263,27 +269,68 @@ class Trainer:
         else:
             raise ValueError(f"Invalid loss type: {cfg.loss_type}")
 
-        self.model = DelphiFork(
-            n_disease=dataset.n_disease,
-            n_tech_tokens=2,
-            n_cont=dataset.n_cont,
-            n_cate=dataset.n_cate,
-            cate_dims=dataset.cate_dims,
-            n_embd=cfg.n_embd,
-            n_layer=cfg.n_layer,
-            n_head=cfg.n_head,
-            pdrop=cfg.pdrop,
-            age_encoder_type=cfg.age_encoder,
-            n_dim=n_dim,
-        ).to(self.device)
+        if cfg.model_type == "delphifork":
+            self.model = DelphiFork(
+                n_disease=dataset.n_disease,
+                n_tech_tokens=2,
+                n_cont=dataset.n_cont,
+                n_cate=dataset.n_cate,
+                cate_dims=dataset.cate_dims,
+                n_embd=cfg.n_embd,
+                n_layer=cfg.n_layer,
+                n_head=cfg.n_head,
+                pdrop=cfg.pdrop,
+                age_encoder_type=cfg.age_encoder,
+                n_dim=n_dim,
+            ).to(self.device)
+        elif cfg.model_type == "sapdelphi":
+            self.model = SapDelphi(
+                n_disease=dataset.n_disease,
+                n_tech_tokens=2,
+                n_cont=dataset.n_cont,
+                n_cate=dataset.n_cate,
+                cate_dims=dataset.cate_dims,
+                n_embd=cfg.n_embd,
+                n_layer=cfg.n_layer,
+                n_head=cfg.n_head,
+                pdrop=cfg.pdrop,
+                age_encoder_type=cfg.age_encoder,
+                n_dim=n_dim,
+                pretrained_weights_path=cfg.pretrained_weights_path,
+                freeze_embeddings=cfg.freeze_embeddings,
+            ).to(self.device)
+        else:
+            raise ValueError(f"Invalid model_type: {cfg.model_type}")
 
         n_params = get_num_params(self.model)
         print(f"Model initialized. Number of parameters: {n_params}")
-        self.optimizer = AdamW(
-            self.model.parameters(),
-            lr=cfg.max_lr,
-            weight_decay=cfg.weight_decay,
-        )
+
+        # Initialize EMA model
+        self.ema_model = self._create_ema_model()
+
+        # Set up optimizer with differential learning rates for SapDelphi
+        if cfg.model_type == "sapdelphi" and not cfg.freeze_embeddings:
+            # token_embedding gets 0.1x the main learning rate
+            emb_params = list(self.model.token_embedding.parameters())
+            other_params = [
+                p for n, p in self.model.named_parameters()
+                if "token_embedding" not in n
+            ]
+            self.optimizer = AdamW(
+                [
+                    {"params": emb_params, "lr": cfg.max_lr * 0.1},
+                    {"params": other_params, "lr": cfg.max_lr},
+                ],
+                weight_decay=cfg.weight_decay,
+            )
+            self._has_differential_lr = True
+        else:
+            self.optimizer = AdamW(
+                self.model.parameters(),
+                lr=cfg.max_lr,
+                weight_decay=cfg.weight_decay,
+            )
+            self._has_differential_lr = False
         self.total_steps = (
             len(self.train_loader) * cfg.max_epochs
         )
@@ -333,6 +380,107 @@ class Trainer:
             json.dump(asdict(self.cfg), f, indent=4)
         print(f"Training configuration saved to {cfg_path}")
 
+    def _create_ema_model(self):
+        """Create a copy of the model for EMA."""
+        # Simply clone the model structure and load current weights
+        if self.cfg.model_type == "delphifork":
+            ema_model = DelphiFork(
+                n_disease=self.model.n_disease,
+                n_tech_tokens=self.model.n_tech_tokens,
+                n_cont=self.model.tabular_encoder.n_cont,
+                n_cate=self.model.tabular_encoder.n_cate,
+                cate_dims=[] if self.model.tabular_encoder.n_cate == 0 else [
+                    emb.num_embeddings for emb in self.model.tabular_encoder.cate_embds
+                ],
+                n_embd=self.model.n_embd,
+                n_layer=len(self.model.blocks),
+                n_head=self.model.n_head,
+                pdrop=self.cfg.pdrop,
+                age_encoder_type=self.cfg.age_encoder,
+                n_dim=self.model.n_dim,
+            )
+        else:  # sapdelphi
+            ema_model = SapDelphi(
+                n_disease=self.model.n_disease,
+                n_tech_tokens=self.model.n_tech_tokens,
+                n_cont=self.model.tabular_encoder.n_cont,
+                n_cate=self.model.tabular_encoder.n_cate,
+                cate_dims=[] if self.model.tabular_encoder.n_cate == 0 else [
+                    emb.num_embeddings for emb in self.model.tabular_encoder.cate_embds
+                ],
+                n_embd=self.model.n_embd,
+                n_layer=len(self.model.blocks),
+                n_head=self.model.n_head,
+                pdrop=self.cfg.pdrop,
+                age_encoder_type=self.cfg.age_encoder,
+                n_dim=self.model.n_dim,
+                pretrained_weights_path=None,
+                freeze_embeddings=False,
+            )
+        ema_model.load_state_dict(self.model.state_dict())
+        ema_model.to(self.device)
+        ema_model.eval()
+        for param in ema_model.parameters():
+            param.requires_grad = False
+        return ema_model
+
+    def _update_ema(self):
+        """Update EMA model parameters."""
+        decay = self.cfg.ema_decay
+        with torch.no_grad():
+            for ema_param, model_param in zip(self.ema_model.parameters(), self.model.parameters()):
+                ema_param.data.mul_(decay).add_(
+                    model_param.data, alpha=1 - decay)
+
+    def _create_ema_model(self):
+        """Create a copy of the model for EMA."""
+        if self.cfg.model_type == "delphifork":
+            ema_model = DelphiFork(
+                n_disease=self.model.n_disease,
+                n_tech_tokens=self.model.n_tech_tokens,
+                n_cont=len(self.model.tabular_encoder.n_cont) if hasattr(
+                    self.model.tabular_encoder, 'n_cont') else 0,
+                n_cate=len(self.model.tabular_encoder.n_cate) if hasattr(
+                    self.model.tabular_encoder, 'n_cate') else 0,
+                cate_dims=[],
+                n_embd=self.model.n_embd,
+                n_layer=len(self.model.blocks),
+                n_head=self.model.n_head,
+                pdrop=self.cfg.pdrop,
+                age_encoder_type=self.cfg.age_encoder,
+                n_dim=self.model.n_dim,
+            )
+        else:  # sapdelphi
+            ema_model = SapDelphi(
+                n_disease=self.model.n_disease,
+                n_tech_tokens=self.model.n_tech_tokens,
+                n_cont=self.model.tabular_encoder.n_cont,
+                n_cate=self.model.tabular_encoder.n_cate,
+                cate_dims=[],
+                n_embd=self.model.n_embd,
+                n_layer=len(self.model.blocks),
+                n_head=self.model.n_head,
+                pdrop=self.cfg.pdrop,
+                age_encoder_type=self.cfg.age_encoder,
+                n_dim=self.model.n_dim,
+                pretrained_weights_path=None,
+                freeze_embeddings=False,
+            )
+        ema_model.load_state_dict(self.model.state_dict())
+        ema_model.to(self.device)
+        ema_model.eval()
+        for param in ema_model.parameters():
+            param.requires_grad = False
+        return ema_model
+
+    def _update_ema(self):
+        """Update EMA model parameters."""
+        decay = self.cfg.ema_decay
+        with torch.no_grad():
+            for ema_param, model_param in zip(self.ema_model.parameters(), self.model.parameters()):
+                ema_param.data.mul_(decay).add_(
+                    model_param.data, alpha=1 - decay)
+
     def compute_lr(self, current_step: int) -> float:
         """Compute learning rate with linear warmup and cosine decay."""
         total_steps = max(int(self.total_steps), 1)
@@ -348,18 +496,6 @@ class Trainer:
                 self.cfg.max_lr - self.cfg.min_lr
             ) * (1 + math.cos(math.pi * progress))
         return lr
-
-    def compute_trimmed_mean(self, values: torch.Tensor, trim: float) -> float:
-        """Compute trimmed mean of a tensor."""
-        if values.numel() == 0:
-            return 0.0
-        sorted_vals, _ = torch.sort(values)
-        n = sorted_vals.size(0)
-        k = int(n * trim)
-        if n - 2 * k <= 0:
-            return sorted_vals.float().mean().item()
-        trimmed_vals = sorted_vals[k:n - k]
-        return trimmed_vals.float().mean().item()
 
     def train(self) -> None:
         # If resuming, keep loaded global_step.
@@ -393,8 +529,13 @@ class Trainer:
                 dt, b_prev, t_prev, b_next, t_next = res
                 self.optimizer.zero_grad()
                 lr = self.compute_lr(self.global_step)
-                for param_group in self.optimizer.param_groups:
-                    param_group["lr"] = lr
+                if self._has_differential_lr:
+                    # Apply 0.1x for token_embedding, 1.0x for others
+                    self.optimizer.param_groups[0]["lr"] = lr * 0.1
+                    self.optimizer.param_groups[1]["lr"] = lr
+                else:
+                    for param_group in self.optimizer.param_groups:
+                        param_group["lr"] = lr
                 logits = self.model(
                     event_seq,
                     time_seq,
@@ -430,6 +571,7 @@ class Trainer:
                 if self.cfg.grad_clip > 0.0:
                     clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
                 self.optimizer.step()
+                self._update_ema()
                 self.global_step += 1
 
             if batch_count == 0:
@@ -438,13 +580,12 @@ class Trainer:
 
             train_nll = running_nll / batch_count
             train_reg = running_reg / batch_count
-            self.model.eval()
-            val_batch_count = 0
+
+            # Validation with EMA model
+            self.ema_model.eval()
             total_val_pairs = 0
             total_val_nll = 0.0
             total_val_reg = 0.0
-            val_nll_list = []
-            val_dt_list = []
             with torch.no_grad():
                 val_pbar = tqdm(self.val_loader, desc="Validation")
                 for batch in val_pbar:
@@ -465,7 +606,7 @@ class Trainer:
                         continue
                     dt, b_prev, t_prev, b_next, t_next = res
                     num_pairs = dt.size(0)
-                    logits = self.model(
+                    logits = self.ema_model(
                         event_seq,
                         time_seq,
                         sexes,
@@ -481,8 +622,6 @@ class Trainer:
                         dt,
                         reduction="none",
                     )
-                    val_nll_list.append(nll.cpu())
-                    val_dt_list.append(dt.cpu())
                     batch_nll_sum = nll.sum().item()
                     total_val_nll += batch_nll_sum
                     total_val_reg += reg.item() * num_pairs
@@ -497,66 +636,9 @@ class Trainer:
                         "NLL": f"{current_val_avg_nll:.4f}",
                         "Reg": f"{current_val_avg_reg:.4f}",
                     })
-                    val_batch_count += 1
 
-            val_nll = total_val_nll / \
-                total_val_pairs if total_val_pairs > 0 else 0.0
-            val_reg = total_val_reg / \
-                total_val_pairs if total_val_pairs > 0 else 0.0
-            if len(val_nll_list) > 0:
-                val_nll_tensor = torch.cat(val_nll_list)
-                trimmed_mean_nll = self.compute_trimmed_mean(
-                    val_nll_tensor,
-                    trim=min(max(float(self.cfg.trimmed_mean_trim), 0.0), 0.49),
-                )
-            else:
-                val_nll_tensor = torch.tensor([])
-                trimmed_mean_nll = 0.0
-
-            if len(val_dt_list) > 0:
-                val_dt_tensor = torch.cat(val_dt_list)
-            else:
-                val_dt_tensor = torch.tensor([])
-
-            median_val_nll = torch.median(
-                val_nll_tensor).item() if len(val_nll_tensor) > 0 else 0.0
-            p90_val_nll = torch.quantile(val_nll_tensor, 0.90).item() if len(
-                val_nll_tensor) > 0 else 0.0
-            p95_val_nll = torch.quantile(val_nll_tensor, 0.95).item() if len(
-                val_nll_tensor) > 0 else 0.0
-            p99_val_nll = torch.quantile(val_nll_tensor, 0.99).item() if len(
-                val_nll_tensor) > 0 else 0.0
-            nonfinite_count = torch.sum(~torch.isfinite(val_nll_tensor)).item()
-            nonfinite_rate = nonfinite_count / \
-                len(val_nll_tensor) if len(val_nll_tensor) > 0 else 0.0
-
-            # Bucketed stats
-            # Buckets: [0, p50], (p50, p90], (p90, p99], (p99, inf)
-            # Thresholds are hard-coded (and correspond to values in bin_edges).
-            p50 = 1.070500
-            p90 = 7.000684
-            p99 = 30.997947
-
-            buckets = {
-                "p00-p50": (val_dt_tensor <= p50),
-                "p50-p90": (val_dt_tensor > p50) & (val_dt_tensor <= p90),
-                "p90-p99": (val_dt_tensor > p90) & (val_dt_tensor <= p99),
-                "p99-inf": (val_dt_tensor > p99),
-            }
-
-            bucket_stats = {}
-            for name, mask in buckets.items():
-                if mask.any():
-                    bnll = val_nll_tensor[mask]
-                    bucket_stats[name] = {
-                        "count": int(bnll.numel()),
-                        "mean": bnll.mean().item(),
-                        "median": torch.median(bnll).item(),
-                        "nonfinite": torch.sum(~torch.isfinite(bnll)).item() / len(bnll)
-                    }
-                else:
-                    bucket_stats[name] = {
-                        "count": 0, "mean": 0.0, "median": 0.0, "nonfinite": 0.0}
+            val_nll = total_val_nll / total_val_pairs if total_val_pairs > 0 else 0.0
+            val_reg = total_val_reg / total_val_pairs if total_val_pairs > 0 else 0.0
 
             history.append({
                 "epoch": epoch,
@@ -564,43 +646,25 @@ class Trainer:
                 "train_reg": train_reg,
                 "val_nll": val_nll,
                 "val_reg": val_reg,
-                "val_nll_median": median_val_nll,
-                "val_nll_p90": p90_val_nll,
-                "val_nll_p95": p95_val_nll,
-                "val_nll_p99": p99_val_nll,
-                "val_nonfinite_rate": nonfinite_rate,
-                "val_nll_trimmed_mean": trimmed_mean_nll,
-                "bucket_stats": bucket_stats,
             })
 
             print(f"Epoch {epoch} Stats:")
             print(f"  Train NLL: {train_nll:.4f}")
-            print(f"  Val NLL (Mean): {val_nll:.4f}")
-            print(f"  Val NLL (Median): {median_val_nll:.4f}")
-            print(
-                f"  Val NLL (Trimmed Mean): {trimmed_mean_nll:.4f} ← PRIMARY METRIC")
-            print(f"  Val NLL (P90): {p90_val_nll:.4f}")
-            print(f"  Val NLL (P95): {p95_val_nll:.4f}")
-            print(f"  Val NLL (P99): {p99_val_nll:.4f}")
-            print(f"  Val Non-Finite Rate: {nonfinite_rate:.4f}")
-            print("  Bucket Stats (Mean/Median/NonFinite):")
-            for name, stats in bucket_stats.items():
-                print(
-                    f"    {name}: {stats['mean']:.4f} / {stats['median']:.4f} / {stats['nonfinite']:.4f} (n={stats.get('count', 0)})")
+            print(f"  Val NLL: {val_nll:.4f} ← PRIMARY METRIC")
 
             with open(os.path.join(self.out_dir, "training_history.json"), "w") as f:
                 json.dump(history, f, indent=4)
 
             # Check for improvement
-            if trimmed_mean_nll < best_val_score:
-                best_val_score = trimmed_mean_nll
+            if val_nll < best_val_score:
+                best_val_score = val_nll
                 patient_counter = 0
                 print("New best validation score. Saving checkpoint.")
 
                 torch.save({
                     "epoch": epoch,
                     "global_step": self.global_step,
-                    "model_state_dict": self.model.state_dict(),
+                    "model_state_dict": self.ema_model.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict(),
                 }, self.best_path)
             else:
@@ -614,7 +678,7 @@ class Trainer:
             torch.save({
                 "epoch": epoch,
                 "global_step": self.global_step,
-                "model_state_dict": self.model.state_dict(),
+                "model_state_dict": self.ema_model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
             }, self.last_path)
 
