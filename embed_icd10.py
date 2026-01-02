@@ -90,6 +90,44 @@ def embed_texts(
     return np.concatenate(all_embs, axis=0)
 
 
+def save_umap_plot(
+    embeddings: np.ndarray,
+    *,
+    out_path: str,
+    random_state: int = 42,
+) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as e:  # pragma: no cover
+        raise ImportError(
+            "UMAP visualization requires matplotlib. Install it with: pip install matplotlib"
+        ) from e
+
+    try:
+        import umap
+    except ImportError as e:  # pragma: no cover
+        raise ImportError(
+            "UMAP visualization requires umap-learn. Install it with: pip install umap-learn"
+        ) from e
+
+    reducer = umap.UMAP(n_components=2, metric="cosine",
+                        random_state=random_state)
+    coords = reducer.fit_transform(embeddings)
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(1, 1, 1)
+    ax.scatter(coords[:, 0], coords[:, 1], s=6, alpha=0.7)
+    ax.set_title("UMAP of ICD label embeddings")
+    ax.set_xlabel("UMAP-1")
+    ax.set_ylabel("UMAP-2")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Embed ICD-10 disease labels with SapBERT")
@@ -120,6 +158,22 @@ def main() -> int:
         action="store_true",
         help="Fail if a label code is not ICD10-like (disallows labels like 'Death')",
     )
+    parser.add_argument(
+        "--umap",
+        action="store_true",
+        help="Also save a 2D UMAP scatterplot of the embeddings",
+    )
+    parser.add_argument(
+        "--umap-out",
+        default=None,
+        help="Path to save UMAP PNG (default: <out-dir>/icd10_sapbert_umap.png)",
+    )
+    parser.add_argument(
+        "--umap-random-state",
+        type=int,
+        default=42,
+        help="Random seed for UMAP",
+    )
     args = parser.parse_args()
 
     labels = _read_labels(args.labels, strict_codes=args.strict_codes)
@@ -143,6 +197,16 @@ def main() -> int:
         w.writerow(["index", "icd10_code", "disease"])
         for i, lbl in enumerate(labels):
             w.writerow([i, lbl.code, lbl.disease])
+
+    if args.umap:
+        umap_path = (
+            args.umap_out
+            if args.umap_out is not None
+            else os.path.join(args.out_dir, "icd10_sapbert_umap.png")
+        )
+        save_umap_plot(embs, out_path=umap_path,
+                       random_state=args.umap_random_state)
+        print(f"Saved UMAP plot:  {umap_path}")
 
     print(f"Saved embeddings: {embs_path} (shape={embs.shape})")
     print(f"Saved metadata:   {meta_path}")
