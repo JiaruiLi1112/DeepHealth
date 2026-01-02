@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from age_encoder import AgeSinusoidalEncoder, AgeMLPEncoder
 from backbones import Block
 from typing import Optional, List
+import numpy as np
 
 
 class TabularEncoder(nn.Module):
@@ -238,6 +239,142 @@ class DelphiFork(nn.Module):
             t_prev: Optional[torch.Tensor] = None,  # (M,)
     ) -> torch.Tensor:
         token_embds = self.token_embedding(event_seq)  # (B, L, D)
+        age_embds = self.age_encoder(time_seq)  # (B, L, D)
+        sex_embds = self.sex_encoder(sex.unsqueeze(-1))  # (B, 1, D)
+        table_embds = self.tabular_encoder(cont_seq, cate_seq)  # (B, Lc, D)
+        mask = (event_seq == 1)  # (B, L)
+        B, L = event_seq.shape
+        Lc = table_embds.size(1)
+        D = table_embds.size(2)
+
+        # occ[b, t] = 第几次出现(从0开始)；非mask位置值无意义，后面会置0
+        # (B, L), DOA: 0,1,2,...
+        occ = torch.cumsum(mask.to(torch.long), dim=1) - 1
+
+        # 将超过 Lc-1 的部分截断；并把非mask位置强制为 0（避免无意义 gather）
+        tab_idx = occ.clamp(min=0, max=max(Lc - 1, 0))
+        tab_idx = tab_idx.masked_fill(~mask, 0)  # (B, L)
+
+        # 按 dim=1 从 (B, Lc, D) 取出每个位置应注入的 tab embedding -> (B, L, D)
+        tab_inject = table_embds.gather(
+            dim=1,
+            index=tab_idx.unsqueeze(-1).expand(-1, -1, D)
+        )
+        # 只在 mask==True 的位置替换
+        final_embds = torch.where(mask.unsqueeze(-1), tab_inject, token_embds)
+
+        x = final_embds + age_embds + sex_embds  # (B, L, D)
+        x = self.token_dropout(x)
+        attn_mask = _build_time_padding_mask(
+            event_seq, time_seq)
+        for block in self.blocks:
+            x = block(x, attn_mask=attn_mask)
+        x = self.ln_f(x)
+
+        if b_prev is not None and t_prev is not None:
+            M = b_prev.numel()
+            c = x[b_prev, t_prev]  # (M, D)
+
+            theta = self.theta_proj(c)  # (M, N_disease * n_dim)
+            theta = theta.view(M, self.n_disease, self.n_dim)
+            return theta
+        else:
+            return x
+
+
+class SapDelphi(nn.Module):
+
+    def __init__(
+            self,
+            n_disease: int,
+            n_tech_tokens: int,
+            n_embd: int,
+            n_head: int,
+            n_layer: int,
+            n_cont: int,
+            n_cate: int,
+            cate_dims: List[int],
+            age_encoder_type: str = "sinusoidal",
+            pdrop: float = 0.0,
+            token_pdrop: float = 0.0,
+            n_dim: int = 1,
+            pretrained_weights_path: Optional[str] = None,  # 新增参数
+            freeze_embeddings: bool = False,               # 新增参数，默认为 False 表示微调
+    ):
+        super().__init__()
+        self.vocab_size = n_disease + n_tech_tokens
+        self.n_tech_tokens = n_tech_tokens
+        self.n_disease = n_disease
+        self.n_embd = n_embd
+        self.n_head = n_head
+        self.n_dim = n_dim
+
+        if pretrained_weights_path is not None:
+            print(
+                f"Loading pretrained embeddings from {pretrained_weights_path}...")
+            bert_weights = np.load(pretrained_weights_path)
+            bert_weights = torch.tensor(bert_weights, dtype=torch.float32)
+
+            vocab_dim = bert_weights.shape[1]  # 通常是 768
+
+            pad_emb = torch.zeros(1, vocab_dim)
+            tech_embs = nn.init.normal_(torch.empty(
+                n_tech_tokens-1, vocab_dim))
+            full_emb_weights = torch.cat(
+                [pad_emb, tech_embs, bert_weights], dim=0)
+            self.token_embedding = nn.Embedding.from_pretrained(
+                full_emb_weights, freeze=freeze_embeddings)
+            print("Pretrained embeddings loaded.")
+            if vocab_dim != n_embd:
+                self.emb_proj = nn.Sequential(
+                    nn.Linear(vocab_dim, n_embd, bias=False),
+                    nn.LayerNorm(n_embd),
+                    nn.Dropout(pdrop),
+                )
+            else:
+                self.emb_proj = nn.Identity()
+        else:
+            self.token_embedding = nn.Embedding(
+                self.vocab_size, n_embd, padding_idx=0)
+            self.emb_proj = nn.Identity()
+
+        if age_encoder_type == "sinusoidal":
+            self.age_encoder = AgeSinusoidalEncoder(n_embd)
+        elif age_encoder_type == "mlp":
+            self.age_encoder = AgeMLPEncoder(n_embd)
+        else:
+            raise ValueError(
+                f"Unsupported age_encoder_type: {age_encoder_type}")
+        self.sex_encoder = nn.Embedding(2, n_embd)
+        self.tabular_encoder = TabularEncoder(
+            n_embd, n_cont, n_cate, cate_dims)
+
+        self.blocks = nn.ModuleList([
+            Block(
+                n_embd=n_embd,
+                n_head=n_head,
+                pdrop=pdrop,
+            ) for _ in range(n_layer)
+        ])
+
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.token_dropout = nn.Dropout(token_pdrop)
+
+        # Head layers
+        self.theta_proj = nn.Linear(n_embd, n_disease * n_dim)
+
+    def forward(
+            self,
+            event_seq: torch.Tensor,  # (B, L)
+            time_seq: torch.Tensor,  # (B, L)
+            sex: torch.Tensor,  # (B,)
+            cont_seq: torch.Tensor,  # (B, Lc, n_cont)
+            cate_seq: torch.Tensor,  # (B, Lc, n_cate)
+            b_prev: Optional[torch.Tensor] = None,  # (M,)
+            t_prev: Optional[torch.Tensor] = None,  # (M,)
+    ) -> torch.Tensor:
+        token_embds = self.token_embedding(event_seq)  # (B, L, Vocab_dim)
+        token_embds = self.emb_proj(token_embds)  # (B, L, D)
         age_embds = self.age_encoder(time_seq)  # (B, L, D)
         sex_embds = self.sex_encoder(sex.unsqueeze(-1))  # (B, 1, D)
         table_embds = self.tabular_encoder(cont_seq, cate_seq)  # (B, Lc, D)
