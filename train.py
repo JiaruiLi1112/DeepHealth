@@ -414,57 +414,8 @@ class Trainer:
                 pdrop=self.cfg.pdrop,
                 age_encoder_type=self.cfg.age_encoder,
                 n_dim=self.model.n_dim,
-                pretrained_weights_path=None,
-                freeze_embeddings=False,
-            )
-        ema_model.load_state_dict(self.model.state_dict())
-        ema_model.to(self.device)
-        ema_model.eval()
-        for param in ema_model.parameters():
-            param.requires_grad = False
-        return ema_model
-
-    def _update_ema(self):
-        """Update EMA model parameters."""
-        decay = self.cfg.ema_decay
-        with torch.no_grad():
-            for ema_param, model_param in zip(self.ema_model.parameters(), self.model.parameters()):
-                ema_param.data.mul_(decay).add_(
-                    model_param.data, alpha=1 - decay)
-
-    def _create_ema_model(self):
-        """Create a copy of the model for EMA."""
-        if self.cfg.model_type == "delphifork":
-            ema_model = DelphiFork(
-                n_disease=self.model.n_disease,
-                n_tech_tokens=self.model.n_tech_tokens,
-                n_cont=len(self.model.tabular_encoder.n_cont) if hasattr(
-                    self.model.tabular_encoder, 'n_cont') else 0,
-                n_cate=len(self.model.tabular_encoder.n_cate) if hasattr(
-                    self.model.tabular_encoder, 'n_cate') else 0,
-                cate_dims=[],
-                n_embd=self.model.n_embd,
-                n_layer=len(self.model.blocks),
-                n_head=self.model.n_head,
-                pdrop=self.cfg.pdrop,
-                age_encoder_type=self.cfg.age_encoder,
-                n_dim=self.model.n_dim,
-            )
-        else:  # sapdelphi
-            ema_model = SapDelphi(
-                n_disease=self.model.n_disease,
-                n_tech_tokens=self.model.n_tech_tokens,
-                n_cont=self.model.tabular_encoder.n_cont,
-                n_cate=self.model.tabular_encoder.n_cate,
-                cate_dims=[],
-                n_embd=self.model.n_embd,
-                n_layer=len(self.model.blocks),
-                n_head=self.model.n_head,
-                pdrop=self.cfg.pdrop,
-                age_encoder_type=self.cfg.age_encoder,
-                n_dim=self.model.n_dim,
-                pretrained_weights_path=None,
-                freeze_embeddings=False,
+                pretrained_weights_path=self.cfg.pretrained_weights_path,
+                freeze_embeddings=self.cfg.freeze_embeddings,
             )
         ema_model.load_state_dict(self.model.state_dict())
         ema_model.to(self.device)
