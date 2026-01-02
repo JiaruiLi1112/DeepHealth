@@ -16,7 +16,8 @@ class Icd10Label:
     disease: str
 
 
-_LABEL_RE = re.compile(r"^\s*([A-Z][0-9][0-9][A-Z0-9]?)\s*\((.+)\)\s*$")
+_LABEL_RE = re.compile(r"^\s*([A-Z][0-9][0-9][A-Z0-9]{0,2})\s*\((.+)\)\s*$")
+_CODE_RE = re.compile(r"^[A-Z][A-Z0-9]{1,6}$")
 
 
 def _read_labels(labels_path: str) -> list[Icd10Label]:
@@ -27,11 +28,23 @@ def _read_labels(labels_path: str) -> list[Icd10Label]:
             if not line:
                 continue
             match = _LABEL_RE.match(line)
-            if match is None:
+            if match is not None:
+                code, disease = match.group(1), match.group(2)
+            else:
+                parts = line.split(maxsplit=1)
+                if len(parts) != 2:
+                    raise ValueError(
+                        f"Unrecognized label format: {line!r}. "
+                        "Expected like 'A00 (cholera)' or 'CXX Unknown Cancer'."
+                    )
+                code, disease = parts[0].strip(), parts[1].strip()
+                if disease.startswith("(") and disease.endswith(")"):
+                    disease = disease[1:-1].strip()
+
+            if not _CODE_RE.match(code):
                 raise ValueError(
-                    f"Unrecognized label format: {line!r}. Expected like 'A00 (cholera)'."
+                    f"Unrecognized ICD10-like code in label: {line!r} (code={code!r})."
                 )
-            code, disease = match.group(1), match.group(2)
             labels.append(Icd10Label(code=code, disease=disease))
     if not labels:
         raise ValueError(f"No labels found in {labels_path!r}.")
