@@ -453,7 +453,7 @@ class Trainer:
         history = []
         best_val_score = float("inf")
         patient_counter = 0
-        for epoch in tqdm(range(self.start_epoch, self.cfg.max_epochs), desc="Overall Training"):
+        for epoch in range(self.start_epoch, self.cfg.max_epochs):
             self.model.train()
             running_nll = 0.0
             running_reg = 0.0
@@ -526,7 +526,8 @@ class Trainer:
                 self.global_step += 1
 
             if batch_count == 0:
-                print("No valid training pairs found this epoch; skipping epoch.")
+                tqdm.write(
+                    "No valid training pairs found this epoch; skipping epoch.")
                 continue
 
             train_nll = running_nll / batch_count
@@ -599,9 +600,9 @@ class Trainer:
                 "val_reg": val_reg,
             })
 
-            print(f"Epoch {epoch} Stats:")
-            print(f"  Train NLL: {train_nll:.4f}")
-            print(f"  Val NLL: {val_nll:.4f} ← PRIMARY METRIC")
+            tqdm.write(f"\nEpoch {epoch+1}/{self.cfg.max_epochs} Stats:")
+            tqdm.write(f"  Train NLL: {train_nll:.4f}")
+            tqdm.write(f"  Val NLL: {val_nll:.4f} ← PRIMARY METRIC")
 
             with open(os.path.join(self.out_dir, "training_history.json"), "w") as f:
                 json.dump(history, f, indent=4)
@@ -610,7 +611,7 @@ class Trainer:
             if val_nll < best_val_score:
                 best_val_score = val_nll
                 patient_counter = 0
-                print("New best validation score. Saving checkpoint.")
+                tqdm.write("  ✓ New best validation score. Saving checkpoint.")
 
                 torch.save({
                     "epoch": epoch,
@@ -621,10 +622,11 @@ class Trainer:
             else:
                 patient_counter += 1
                 if epoch+1 >= self.cfg.min_epochs and patient_counter >= self.cfg.patient_epochs:
-                    print(
-                        f"No improvement in validation score for {patient_counter} epochs. Early stopping.")
+                    tqdm.write(
+                        f"\n⚠ No improvement in validation score for {patient_counter} epochs. Early stopping.")
                     return
-                print("No improvement in validation score.")
+                tqdm.write(
+                    f"  No improvement (patience: {patient_counter}/{self.cfg.patient_epochs})")
 
             torch.save({
                 "epoch": epoch,
@@ -633,7 +635,7 @@ class Trainer:
                 "optimizer_state_dict": self.optimizer.state_dict(),
             }, self.last_path)
 
-        print("Training complete.")
+        tqdm.write("\n🎉 Training complete!")
 
 
 if __name__ == "__main__":

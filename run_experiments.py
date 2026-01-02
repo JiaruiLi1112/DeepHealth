@@ -7,7 +7,7 @@ from queue import Queue
 
 # ================= 配置区域 =================
 # 全局训练参数
-COMMON_ARGS = "--max_epochs 50"
+COMMON_ARGS = "--max_epochs 50 --pdrop 0.1"
 EMBED_PATH = "icd10_sapbert_embeddings.npy"
 
 # 定义所有实验 (与之前的 ablation 设计保持一致)
