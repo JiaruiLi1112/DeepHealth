@@ -343,7 +343,7 @@ class Trainer:
         else:
             while True:
                 cov_suffix = "fullcov" if cfg.full_cov else "nocov"
-                name = f"{cfg.loss_type}_{cfg.age_encoder}_{cov_suffix}"
+                name = f"{cfg.model_type}_{cfg.loss_type}_{cfg.age_encoder}_{cov_suffix}"
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
                 model_dir = os.path.join("runs", f"{name}_{timestamp}")
                 if not os.path.exists(model_dir):
