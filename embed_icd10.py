@@ -32,12 +32,18 @@ def _read_labels(labels_path: str) -> list[Icd10Label]:
                 code, disease = match.group(1), match.group(2)
             else:
                 parts = line.split(maxsplit=1)
-                if len(parts) != 2:
+                if len(parts) == 1:
+                    # Some label lists include non-ICD entries (e.g., "Death").
+                    # Treat these as both code and disease.
+                    code = parts[0].strip()
+                    disease = code
+                elif len(parts) == 2:
+                    code, disease = parts[0].strip(), parts[1].strip()
+                else:
                     raise ValueError(
                         f"Unrecognized label format: {line!r}. "
-                        "Expected like 'A00 (cholera)' or 'CXX Unknown Cancer'."
+                        "Expected like 'A00 (cholera)', 'CXX Unknown Cancer', or 'Death'."
                     )
-                code, disease = parts[0].strip(), parts[1].strip()
                 if disease.startswith("(") and disease.endswith(")"):
                     disease = disease[1:-1].strip()
 
