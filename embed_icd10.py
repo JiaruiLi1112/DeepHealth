@@ -92,6 +92,7 @@ def embed_texts(
 
 def save_umap_plot(
     embeddings: np.ndarray,
+    codes: list[str],
     *,
     out_path: str,
     random_state: int = 42,
@@ -117,9 +118,30 @@ def save_umap_plot(
                         random_state=random_state)
     coords = reducer.fit_transform(embeddings)
 
+    if len(codes) != coords.shape[0]:
+        raise ValueError(
+            f"codes length ({len(codes)}) does not match embeddings rows ({coords.shape[0]})."
+        )
+
+    groups: list[str] = []
+    for code in codes:
+        cleaned = code.strip()
+        if cleaned.lower() == "death":
+            groups.append("Death")
+        else:
+            groups.append(cleaned[:1].upper() if cleaned else "?")
+
+    group_names = sorted({g for g in groups if g != "Death"})
+    cmap = plt.get_cmap("tab20")
+    group_to_color: dict[str, object] = {
+        g: cmap(i % cmap.N) for i, g in enumerate(group_names)
+    }
+    group_to_color["Death"] = "grey"
+    colors = [group_to_color.get(g, "black") for g in groups]
+
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(1, 1, 1)
-    ax.scatter(coords[:, 0], coords[:, 1], s=6, alpha=0.7)
+    ax.scatter(coords[:, 0], coords[:, 1], s=6, alpha=0.7, c=colors)
     ax.set_title("UMAP of ICD label embeddings")
     ax.set_xlabel("UMAP-1")
     ax.set_ylabel("UMAP-2")
@@ -204,8 +226,12 @@ def main() -> int:
             if args.umap_out is not None
             else os.path.join(args.out_dir, "icd10_sapbert_umap.png")
         )
-        save_umap_plot(embs, out_path=umap_path,
-                       random_state=args.umap_random_state)
+        save_umap_plot(
+            embs,
+            [lbl.code for lbl in labels],
+            out_path=umap_path,
+            random_state=args.umap_random_state,
+        )
         print(f"Saved UMAP plot:  {umap_path}")
 
     print(f"Saved embeddings: {embs_path} (shape={embs.shape})")
