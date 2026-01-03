@@ -150,7 +150,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--grad_clip", type=float,
                         default=1.0, help="Gradient clipping value")
     parser.add_argument("--ema_decay", type=float,
-                        default=0.999, help="EMA decay rate for model parameters")
+                        default=0.9999, help="EMA decay rate for model parameters")
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use for training")
     args = parser.parse_args()
@@ -389,12 +389,17 @@ class Trainer:
         return ema_model
 
     def _update_ema(self):
-        """Update EMA model parameters."""
-        decay = self.cfg.ema_decay
+        """Update EMA model parameters with adaptive decay."""
+        # Adaptive EMA decay
+        current_decay = min(
+            self.cfg.ema_decay,
+            (1 + self.global_step) / (10 + self.global_step)
+        )
+
         with torch.no_grad():
             for ema_param, model_param in zip(self.ema_model.parameters(), self.model.parameters()):
-                ema_param.data.mul_(decay).add_(
-                    model_param.data, alpha=1 - decay)
+                ema_param.data.mul_(current_decay).add_(
+                    model_param.data, alpha=1 - current_decay)
 
     def compute_lr(self, current_step: int) -> float:
         """Compute learning rate with linear warmup and cosine decay."""
