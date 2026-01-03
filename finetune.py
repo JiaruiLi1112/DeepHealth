@@ -293,6 +293,16 @@ class Trainer:
         else:
             print("Warning: 'model_state_dict' not found in checkpoint.")
 
+        # Load criterion parameters if present (e.g., LogNormalBasisHazardLoss.log_sigma)
+        if "criterion_state_dict" in ckpt:
+            try:
+                self.criterion.load_state_dict(
+                    ckpt["criterion_state_dict"], strict=True)
+                print("Criterion state loaded from checkpoint.")
+            except Exception as e:
+                print(
+                    f"Warning: failed to load criterion_state_dict (continuing with fresh criterion params): {e}")
+
         n_params = get_num_params(self.model)
         print(f"Model initialized. Number of parameters: {n_params}")
 
@@ -307,6 +317,8 @@ class Trainer:
                 p for n, p in self.model.named_parameters()
                 if "token_embedding" not in n
             ]
+            # Include criterion parameters (e.g., LogNormalBasisHazardLoss.log_sigma)
+            other_params.extend(list(self.criterion.parameters()))
             self.optimizer = AdamW(
                 [
                     {"params": emb_params, "lr": cfg.max_lr * 0.1},
@@ -317,7 +329,7 @@ class Trainer:
             self._has_differential_lr = True
         else:
             self.optimizer = AdamW(
-                self.model.parameters(),
+                list(self.model.parameters()) + list(self.criterion.parameters()),
                 lr=cfg.max_lr,
                 weight_decay=cfg.weight_decay,
             )
@@ -489,7 +501,11 @@ class Trainer:
                 })
                 loss.backward()
                 if self.cfg.grad_clip > 0.0:
-                    clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+                    clip_grad_norm_(
+                        list(self.model.parameters()) +
+                        list(self.criterion.parameters()),
+                        self.cfg.grad_clip,
+                    )
                 self.optimizer.step()
                 self._update_ema()
                 self.global_step += 1
@@ -586,6 +602,7 @@ class Trainer:
                     "epoch": epoch,
                     "global_step": self.global_step,
                     "model_state_dict": self.ema_model.state_dict(),
+                    "criterion_state_dict": self.criterion.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict(),
                 }, self.best_path)
             else:
@@ -601,6 +618,7 @@ class Trainer:
                 "epoch": epoch,
                 "global_step": self.global_step,
                 "model_state_dict": self.ema_model.state_dict(),
+                "criterion_state_dict": self.criterion.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
             }, self.last_path)
 
