@@ -19,7 +19,6 @@ from dataset import HealthDataset, health_collate_fn
 from model import DelphiFork, SapDelphi
 from losses import (
     ExponentialNLLLoss,
-    WeibullNLLLoss,
     LogNormalBasisHazardLoss,
     get_valid_pairs_and_dt,
 )
@@ -31,7 +30,7 @@ class TrainConfig:
     Configuration for training the DelphiFork model.
 
     Args:
-        loss_type (str): Type of loss function. Options: 'exponential', 'weibull', 'lognormal'.
+        loss_type (str): Type of loss function. Options: 'exponential', 'lognormal'.
         age_encoder (str): Age encoder type. Options: 'sinusoidal', 'mlp'.
         full_cov (bool): Whether to use full covariance matrix.
         n_embd (int): Embedding dimension.
@@ -58,12 +57,11 @@ class TrainConfig:
     """
     # Model parameters
     model_type: Literal["delphifork", "sapdelphi"] = "delphifork"
-    # Options: 'exponential', 'weibull', 'lognormal'
+    # Options: 'exponential', 'lognormal'
     loss_type: Literal[
         "exponential",
-        "weibull",
         "lognormal",
-    ] = "weibull"
+    ] = "lognormal"
     age_encoder: Literal["sinusoidal", "mlp"] = "sinusoidal"
     full_cov: bool = False
     n_embd: int = 120
@@ -108,7 +106,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--model_type", type=str,
                         default="delphifork", help="Model type: delphifork or sapdelphi")
     parser.add_argument("--loss_type", type=str,
-                        default="weibull", help="Type of loss function")
+                        default="lognormal", help="Type of loss function")
     parser.add_argument("--full_cov", action="store_true",
                         help="Use full covariance matrix")
     parser.add_argument("--age_encoder", type=str,
@@ -253,11 +251,6 @@ class Trainer:
                 lambda_reg=cfg.lambda_reg,
             ).to(self.device)
             n_dim = 1
-        elif cfg.loss_type == "weibull":
-            self.criterion = WeibullNLLLoss(
-                lambda_reg=cfg.lambda_reg,
-            ).to(self.device)
-            n_dim = 2
         elif cfg.loss_type == "lognormal":
             centers = list(bin_edges)
             self.criterion = LogNormalBasisHazardLoss(
@@ -328,7 +321,8 @@ class Trainer:
             self._has_differential_lr = True
         else:
             self.optimizer = AdamW(
-                list(self.model.parameters()) + list(self.criterion.parameters()),
+                list(self.model.parameters()) +
+                list(self.criterion.parameters()),
                 lr=cfg.max_lr,
                 weight_decay=cfg.weight_decay,
             )

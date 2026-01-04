@@ -15,24 +15,20 @@ EMBED_PATH = "icd10_sapbert_embeddings.npy"
 EXPERIMENTS = [
     # --- Group A: Baselines (No Pretraining) ---
     ("Exp01_Base_Exp", f"--model_type delphifork --loss_type exponential --age_encoder sinusoidal --full_cov"),
-    ("Exp02_Base_Weibull",
-     f"--model_type delphifork --loss_type weibull --age_encoder mlp --full_cov"),
-    ("Exp03_Base_LogNormal",
+    ("Exp02_Base_LogNormal",
      f"--model_type delphifork --loss_type lognormal --age_encoder mlp --full_cov"),
 
     # --- Group B: SapBERT Pretraining (Core) ---
-    ("Exp04_Sap_Freeze",
+    ("Exp03_Sap_Freeze",
      f"--model_type sapdelphi --loss_type lognormal --age_encoder mlp --full_cov --pretrained_weights_path {EMBED_PATH} --freeze_embeddings"),
-    ("Exp05_Sap_Finetune",
+    ("Exp04_Sap_Finetune",
      # 默认 finetune
      f"--model_type sapdelphi --loss_type lognormal --age_encoder mlp --full_cov --pretrained_weights_path {EMBED_PATH}"),
-    ("Exp06_Sap_Weibull",
-     f"--model_type sapdelphi --loss_type weibull --age_encoder mlp --full_cov --pretrained_weights_path {EMBED_PATH}"),
 
     # --- Group C: Data Efficiency (Lite Covariates) ---
     # 去掉了 --full_cov 即为 Lite 模式
-    ("Exp07_Lite_Base", f"--model_type delphifork --loss_type lognormal --age_encoder mlp"),
-    ("Exp08_Lite_Sap",
+    ("Exp05_Lite_Base", f"--model_type delphifork --loss_type lognormal --age_encoder mlp"),
+    ("Exp06_Lite_Sap",
      f"--model_type sapdelphi --loss_type lognormal --age_encoder mlp --pretrained_weights_path {EMBED_PATH}"),
 ]
 # ===========================================
