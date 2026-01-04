@@ -63,12 +63,22 @@ class TabularEncoder(nn.Module):
             nn.Linear(2 * n_embd, 2 * n_embd),
         )
 
+        self.apply(self._init_weights)
+        self.out_ln = nn.LayerNorm(n_embd)
+
+        # Zero-init the last layer of FiLM to start with identity modulation
         with torch.no_grad():
-            for m in self.modules():
-                last_linear = self.film[-1]
-                if isinstance(m, nn.Linear):
-                    last_linear.weight.zero_()
-                    last_linear.bias.zero_()
+            last_linear = self.film[-1]
+            last_linear.weight.zero_()
+            last_linear.bias.zero_()
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(
         self,
@@ -134,8 +144,19 @@ class TabularEncoder(nn.Module):
                 value_parts.append(cate_value)
                 mask_parts.append(cate_mask_value)
 
-        h_value = torch.stack(value_parts, dim=0).sum(dim=0)
-        h_mask = torch.stack(mask_parts, dim=0).sum(dim=0)
+        if not value_parts:
+            if cont_features is not None:
+                B, L = cont_features.shape[:2]
+                device = cont_features.device
+            elif cate_features is not None:
+                B, L = cate_features.shape[:2]
+                device = cate_features.device
+            else:
+                raise ValueError("No features provided to TabularEncoder.")
+            return torch.zeros(B, L, self.n_embd, device=device)
+
+        h_value = torch.stack(value_parts, dim=0).mean(dim=0)
+        h_mask = torch.stack(mask_parts, dim=0).mean(dim=0)
         h_mask_flat = h_mask.view(-1, self.n_embd)
         film_params = self.film(h_mask_flat)
         gamma_delta, beta = film_params.chunk(2, dim=-1)
@@ -143,6 +164,7 @@ class TabularEncoder(nn.Module):
         h_value_flat = h_value.view(-1, self.n_embd)
         h_out = gamma * h_value_flat + beta
         h_out = h_out.view(B, L, self.n_embd)
+        h_out = self.out_ln(h_out)
         return h_out
 
 
