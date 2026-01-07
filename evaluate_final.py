@@ -273,14 +273,19 @@ def _build_landmark_batch(
         if t_hist.numel() == 0:
             # no history before landmark -> skip (or keep with only landmark)
             # keeping is OK, but some datasets may be empty. We'll keep with landmark only.
-            e_hist = torch.tensor([LANDMARK_EVENT], dtype=e_seq.dtype)
-            t_hist = torch.tensor([t0_days], dtype=t_seq.dtype)
+            e_hist = torch.tensor(
+                [LANDMARK_EVENT], dtype=e_seq.dtype, device=e_seq.device)
+            t_hist = torch.tensor(
+                [t0_days], dtype=t_seq.dtype, device=t_seq.device)
         else:
             # Append explicit landmark token at t0 (even if last event is at t0)
-            e_hist = torch.cat([e_hist, torch.tensor(
-                [LANDMARK_EVENT], dtype=e_seq.dtype)])
+            e_hist = torch.cat([
+                e_hist,
+                torch.tensor([LANDMARK_EVENT], dtype=e_seq.dtype,
+                             device=e_seq.device),
+            ])
             t_hist = torch.cat(
-                [t_hist, torch.tensor([t0_days], dtype=t_seq.dtype)])
+                [t_hist, torch.tensor([t0_days], dtype=t_seq.dtype, device=t_seq.device)])
 
         # Prevalence up to t0 (exclude tech tokens <2)
         prev_vec = np.zeros(base_dataset.n_disease, dtype=bool)
