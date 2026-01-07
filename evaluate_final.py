@@ -68,6 +68,9 @@ def calculate_conditional_risk(theta, t_start, t_end, loss_type, loss_fn=None):
 
         # The user requested using F explicitly.
         dt = t_end - t_start
+        if isinstance(dt, torch.Tensor) and dt.ndim == 1:
+            dt = dt.unsqueeze(-1)  # (B, 1)
+
         risk = 1.0 - torch.exp(-lambdas * dt)
         return risk
 
