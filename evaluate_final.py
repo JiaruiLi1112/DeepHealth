@@ -62,9 +62,9 @@ def get_chapter(code_str):
 
 def calculate_risk_score(theta, t_start, t_end, loss_type, loss_fn=None):
     """
-    Calculate Probability Mass in [t_start, t_end].
-    Score = F(t_end) - F(t_start).
-    This is unconditioned probability mass, robust for ranking.
+    Calculate Conditional Risk Probability in [t_start, t_end].
+    Score = P(t_start < T <= t_end | T > t_start)
+          = 1 - exp( - (H(t_end) - H(t_start)) )
     """
     device = theta.device
 
@@ -74,7 +74,7 @@ def calculate_risk_score(theta, t_start, t_end, loss_type, loss_fn=None):
             logits = logits.squeeze(-1)
         lambdas = F.softplus(logits)
 
-        # Exponential is memoryless, risks depends only on interval length
+        # Exponential is memoryless, risk depends only on interval length
         dt = t_end - t_start
         if isinstance(dt, torch.Tensor) and dt.ndim == 1:
             dt = dt.unsqueeze(-1)
@@ -84,36 +84,51 @@ def calculate_risk_score(theta, t_start, t_end, loss_type, loss_fn=None):
 
     elif loss_type == "lognormal":
         if loss_fn is None:
-            raise ValueError("loss_fn required")
+            raise ValueError("loss_fn required for lognormal")
         coeffs = theta
 
-        def compute_F(t_vals):
-            if isinstance(t_vals, float) or isinstance(t_vals, int):
+        # Helper to compute Cumulative Hazard H(t) directly
+        def compute_H(t_vals):
+            if isinstance(t_vals, (float, int)):
                 t_vals = torch.full(
                     (coeffs.shape[0],), float(t_vals), device=device)
 
+            # Ensure t > 0
             t = torch.clamp(t_vals, min=1e-5)
+
+            # Gauss-Legendre Quadrature to integrate hazard from 0 to t
             x_nodes, w = _gauss_legendre_16(device=device, dtype=coeffs.dtype)
 
+            # Map nodes from [-1, 1] to [0, t]
+            # u: (B, 16) - time points for integration
             u = (t.unsqueeze(1) / 2.0) * (x_nodes.unsqueeze(0) + 1.0)
             weights = (t.unsqueeze(1) / 2.0) * w.unsqueeze(0)
 
+            # Calculate hazard at each integration point u
             u_flat = u.reshape(-1)
             K_u_flat = loss_fn._compute_kernel(u_flat)
-            K_u = K_u_flat.view(u.shape[0], u.shape[1], -1)
+            K_u = K_u_flat.view(u.shape[0], u.shape[1], -1)  # (B, 16, n_basis)
 
+            # Log hazard: sum(coeff * kernel)
             log_hazards_u = torch.einsum("mkb,mqb->mkq", coeffs, K_u)
             log_hazards_u = torch.clamp(log_hazards_u, max=20.0)
             hazards_u = torch.exp(log_hazards_u)
 
-            H = torch.sum(hazards_u * weights.unsqueeze(1), dim=2)
-            return 1.0 - torch.exp(-H)
+            # Integral = sum(hazard * weight)
+            H = torch.sum(hazards_u * weights.unsqueeze(1), dim=2)  # (B, K)
+            return H
 
-        F_start = compute_F(t_start)
-        F_end = compute_F(t_end)
+        # 1. Compute Cumulative Hazard from 0 to t_start
+        H_start = compute_H(t_start)
 
-        # Probability Mass
-        return torch.clamp(F_end - F_start, min=0.0)
+        # 2. Compute Cumulative Hazard from 0 to t_end
+        H_end = compute_H(t_end)
+
+        # 3. Calculate Conditional Risk: 1 - exp( - (H_end - H_start) )
+        # H is strictly increasing, so H_end - H_start >= 0
+        H_interval = torch.clamp(H_end - H_start, min=0.0)
+
+        return 1.0 - torch.exp(-H_interval)
 
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}")
