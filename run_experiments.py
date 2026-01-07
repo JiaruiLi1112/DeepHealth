@@ -7,27 +7,20 @@ from queue import Queue
 
 # ================= 配置区域 =================
 # 全局训练参数
-COMMON_ARGS = "--pdrop 0.1"
+COMMON_ARGS = "--pdrop 0.0 --weight_decay 0.0 --lambda_reg 0.0"
 EMBED_PATH = "icd10_sapbert_embeddings.npy"
 
 # 定义所有实验 (与之前的 ablation 设计保持一致)
 # 格式: (实验名, 独有参数字符串)
 EXPERIMENTS = [
     # --- Group A: Baselines (No Pretraining) ---
-    ("Exp01_Base_Exp", f"--model_type delphifork --loss_type exponential --age_encoder sinusoidal --full_cov"),
-    ("Exp02_Base_LogNormal",
+    ("Exp01_Base_LogNormal",
      f"--model_type delphifork --loss_type lognormal --age_encoder mlp --full_cov"),
 
     # --- Group B: SapBERT Pretraining (Core) ---
     ("Exp03_Sap_Freeze",
      f"--model_type sapdelphi --loss_type lognormal --age_encoder mlp --full_cov --pretrained_weights_path {EMBED_PATH} --freeze_embeddings"),
-    ("Exp04_Sap_Finetune",
-     # 默认 finetune
-     f"--model_type sapdelphi --loss_type lognormal --age_encoder mlp --full_cov --pretrained_weights_path {EMBED_PATH}"),
 
-    # --- Group C: Data Efficiency (Lite Covariates) ---
-    # 去掉了 --full_cov 即为 Lite 模式
-    ("Exp05_Lite_Base", f"--model_type delphifork --loss_type lognormal --age_encoder mlp"),
     ("Exp06_Lite_Sap",
      f"--model_type sapdelphi --loss_type lognormal --age_encoder mlp --pretrained_weights_path {EMBED_PATH}"),
 ]
