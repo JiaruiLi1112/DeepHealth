@@ -173,7 +173,7 @@ def calculate_risk_score(
                     torch.clamp(u_flat, min=1e-5))
                 K_u = K_u_flat.view(B, Q, -1)
 
-            log_h = torch.einsum("bkb,bqb->bkq", coeffs, K_u)  # (B,K,Q)
+            log_h = torch.einsum("bkn,bqn->bkq", coeffs, K_u)  # (B,K,Q)
             log_h = torch.clamp(log_h, max=20.0)
             return torch.exp(log_h)  # (B,K,Q)
 
