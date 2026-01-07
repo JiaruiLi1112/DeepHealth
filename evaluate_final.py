@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, random_split
 from collections import defaultdict
 from sklearn.metrics import roc_auc_score
 from lifelines.utils import concordance_index
@@ -146,11 +146,20 @@ def run_stratified_evaluation(dataset, model, loss_fn, args, disease_map):
 
     print(f"Death ID identified as: {death_id}")
 
+    # Handle Subset or original Dataset
+    if isinstance(dataset, Subset):
+        base_dataset = dataset.dataset
+        def get_real_idx(i): return dataset.indices[i]
+    else:
+        base_dataset = dataset
+        def get_real_idx(i): return i
+
     # Pre-select patients for efficiency
     patient_meta = []
     for i in range(len(dataset)):
-        pid = dataset.patient_ids[i]
-        events = sorted(dataset.patient_events[pid], key=lambda x: x[0])
+        real_idx = get_real_idx(i)
+        pid = base_dataset.patient_ids[real_idx]
+        events = sorted(base_dataset.patient_events[pid], key=lambda x: x[0])
         ts = [x[0]/365.25 for x in events]
         es = [x[1] for x in events]
 
@@ -285,6 +294,7 @@ def run_stratified_evaluation(dataset, model, loss_fn, args, disease_map):
 
                 B_curr = event_batch.shape[0]
 
+                kept_indices = []
                 for k in range(B_curr):
                     valid_len = (event_batch[k] != 0).sum().item()
                     e_seq = event_batch[k, :valid_len]
@@ -293,6 +303,11 @@ def run_stratified_evaluation(dataset, model, loss_fn, args, disease_map):
                     mask = t_seq <= limit_days
                     t_trunc = t_seq[mask]
                     e_trunc = e_seq[mask]
+
+                    if len(t_trunc) == 0:
+                        continue
+
+                    kept_indices.append(k)
 
                     # Removed artificial appending of DOA token per user request.
                     # t_trunc = torch.cat([t_trunc, torch.tensor([limit_days],  dtype=t_trunc.dtype)])
@@ -308,13 +323,16 @@ def run_stratified_evaluation(dataset, model, loss_fn, args, disease_map):
                         t_seq <= target_end_days)
                     target_events = e_seq[in_window_mask].tolist()
 
-                    tgt_vec = np.zeros(dataset.n_disease, dtype=float)
+                    tgt_vec = np.zeros(base_dataset.n_disease, dtype=float)
                     for eid in target_events:
                         if eid >= 2:
                             idx_in_vec = eid - 2
-                            if idx_in_vec < dataset.n_disease:
+                            if idx_in_vec < base_dataset.n_disease:
                                 tgt_vec[idx_in_vec] = 1.0
                     batch_targets.append(tgt_vec)
+
+                if len(new_event_seqs) == 0:
+                    continue
 
                 from torch.nn.utils.rnn import pad_sequence
                 event_in = pad_sequence(
@@ -322,20 +340,23 @@ def run_stratified_evaluation(dataset, model, loss_fn, args, disease_map):
                 time_in = pad_sequence(
                     new_time_seqs, batch_first=True, padding_value=36525.0).to(args.device)
 
-                cont_in = cont_batch.to(args.device)
-                cate_in = cate_batch.to(args.device)
-                sex_in = sex_batch.to(args.device)
+                kept_indices_tensor = torch.tensor(
+                    kept_indices, device=cont_batch.device)
+                cont_in = cont_batch[kept_indices_tensor].to(args.device)
+                cate_in = cate_batch[kept_indices_tensor].to(args.device)
+                sex_in = sex_batch[kept_indices_tensor].to(args.device)
 
                 lengths = torch.tensor(
                     [len(x) for x in new_event_seqs], device=args.device)
-                b_prev = torch.arange(B_curr, device=args.device)
+                b_prev = torch.arange(len(new_event_seqs), device=args.device)
                 t_prev = lengths - 1
 
                 theta = model(event_in, time_in, sex_in, cont_in,
                               cate_in, b_prev=b_prev, t_prev=t_prev)
 
                 n_dim = model.n_dim
-                theta = theta.view(B_curr, dataset.n_disease, n_dim)
+                theta = theta.view(len(new_event_seqs),
+                                   base_dataset.n_disease, n_dim)
 
                 # Correct logic for Time Anchor Mismatch:
                 # The model predicts risk starting from t_last (last event time).
@@ -371,7 +392,7 @@ def run_stratified_evaluation(dataset, model, loss_fn, args, disease_map):
         auc_scores = {}  # d_idx -> auc
 
         print(f"Evaluating Age {age} metrics...")
-        for d_idx in range(dataset.n_disease):
+        for d_idx in range(base_dataset.n_disease):
             y_true = all_targets[:, d_idx]
             y_score = all_risks[:, d_idx]
 
@@ -417,11 +438,20 @@ def run_landmark_analysis(dataset, model, loss_fn, args):
     t_landmark = 60.0
     limit_days = t_landmark * 365.25
 
+    # Handle Subset or original Dataset
+    if isinstance(dataset, Subset):
+        base_dataset = dataset.dataset
+        def get_real_idx(i): return dataset.indices[i]
+    else:
+        base_dataset = dataset
+        def get_real_idx(i): return i
+
     eligible_indices = []
 
     for i in range(len(dataset)):
-        pid = dataset.patient_ids[i]
-        events = dataset.patient_events[pid]
+        real_idx = get_real_idx(i)
+        pid = base_dataset.patient_ids[real_idx]
+        events = base_dataset.patient_events[pid]
         has_future = any(x[0] > limit_days for x in events)
         if has_future:
             eligible_indices.append(i)
@@ -452,6 +482,7 @@ def run_landmark_analysis(dataset, model, loss_fn, args):
             batch_targets = {h: [] for h in horizons}
 
             B_curr = event_batch.shape[0]
+            kept_indices = []
             for k in range(B_curr):
                 valid_len = (event_batch[k] != 0).sum().item()
                 e_seq = event_batch[k, :valid_len]
@@ -460,6 +491,10 @@ def run_landmark_analysis(dataset, model, loss_fn, args):
                 mask = t_seq <= limit_days
                 t_trunc = t_seq[mask]
                 e_trunc = e_seq[mask]
+
+                if len(t_trunc) == 0:
+                    continue
+                kept_indices.append(k)
 
                 # Removed artificial appending of DOA per user request regarding Experiment 1.
                 # Assuming Experiment 2 should follow same rigorous truncation.
@@ -474,29 +509,36 @@ def run_landmark_analysis(dataset, model, loss_fn, args):
                     in_window = (t_seq > limit_days) & (t_seq <= h_days)
                     tgt_codes = e_seq[in_window].tolist()
 
-                    vec = np.zeros(dataset.n_disease, dtype=float)
+                    vec = np.zeros(base_dataset.n_disease, dtype=float)
                     for c in tgt_codes:
-                        if c >= 2 and c-2 < dataset.n_disease:
+                        if c >= 2 and c-2 < base_dataset.n_disease:
                             vec[c-2] = 1.0
                     batch_targets[h].append(vec)
+
+            if len(new_event_seqs) == 0:
+                continue
 
             from torch.nn.utils.rnn import pad_sequence
             event_in = pad_sequence(
                 new_event_seqs, batch_first=True, padding_value=0).to(args.device)
             time_in = pad_sequence(
                 new_time_seqs, batch_first=True, padding_value=36525.0).to(args.device)
-            cont_in = cont_batch.to(args.device)
-            cate_in = cate_batch.to(args.device)
-            sex_in = sex_batch.to(args.device)
+
+            kept_indices_tensor = torch.tensor(
+                kept_indices, device=cont_batch.device)
+            cont_in = cont_batch[kept_indices_tensor].to(args.device)
+            cate_in = cate_batch[kept_indices_tensor].to(args.device)
+            sex_in = sex_batch[kept_indices_tensor].to(args.device)
 
             lengths = torch.tensor([len(x)
                                    for x in new_event_seqs], device=args.device)
-            b_prev = torch.arange(B_curr, device=args.device)
+            b_prev = torch.arange(len(new_event_seqs), device=args.device)
             t_prev = lengths - 1
 
             theta = model(event_in, time_in, sex_in, cont_in,
                           cate_in, b_prev=b_prev, t_prev=t_prev)
-            theta = theta.view(B_curr, dataset.n_disease, model.n_dim)
+            theta = theta.view(len(new_event_seqs),
+                               base_dataset.n_disease, model.n_dim)
 
             # Correct logic for Time Anchor Mismatch:
             # Anchor is fixed at limit_days (Age 60).
@@ -610,7 +652,28 @@ if __name__ == "__main__":
         sys.exit(1)
 
     dataset = HealthDataset(data_prefix=data_prefix, covariate_list=cov_list)
-    print(f"Dataset size: {len(dataset)}")
+    print(f"Full Dataset size: {len(dataset)}")
+
+    # Split dataset based on config
+    n_total = len(dataset)
+    train_ratio = cfg_dict.get("train_ratio", 0.7)
+    val_ratio = cfg_dict.get("val_ratio", 0.15)
+    test_ratio = 1.0 - train_ratio - val_ratio
+    random_seed = cfg_dict.get("random_seed", 42)
+
+    train_len = int(n_total * train_ratio)
+    val_len = int(n_total * val_ratio)
+    test_len = n_total - train_len - val_len
+
+    _, _, test_dataset = random_split(
+        dataset,
+        [train_len, val_len, test_len],
+        generator=torch.Generator().manual_seed(random_seed)
+    )
+    print(f"Using test split with {len(test_dataset)} samples.")
+
+    # Use the test subset for evaluation
+    eval_dataset = test_dataset
 
     n_dim = 1
     loss_fn = None
@@ -683,7 +746,7 @@ if __name__ == "__main__":
 
     disease_map = load_labels()
 
-    run_stratified_evaluation(dataset, model, loss_fn, args, disease_map)
-    run_landmark_analysis(dataset, model, loss_fn, args)
+    run_stratified_evaluation(eval_dataset, model, loss_fn, args, disease_map)
+    run_landmark_analysis(eval_dataset, model, loss_fn, args)
 
     print("Evaluation Complete.")
