@@ -61,77 +61,126 @@ def get_chapter(code_str):
 
 
 def calculate_risk_score(theta, t_start, t_end, loss_type, loss_fn=None):
-    """
-    Calculate Conditional Risk Probability in [t_start, t_end].
-    Score = P(t_start < T <= t_end | T > t_start)
-          = 1 - exp( - (H(t_end) - H(t_start)) )
-    """
     device = theta.device
 
     if loss_type == "exponential":
         logits = theta
         if logits.dim() == 3:
             logits = logits.squeeze(-1)
-        lambdas = F.softplus(logits)
+        lambdas = F.softplus(logits)  # (B, K)
 
-        # Exponential is memoryless, risk depends only on interval length
         dt = t_end - t_start
         if isinstance(dt, torch.Tensor) and dt.ndim == 1:
-            dt = dt.unsqueeze(-1)
+            dt = dt.unsqueeze(-1)  # (B, 1)
 
-        # P(Event in dt) = 1 - exp(-lambda * dt)
-        return 1.0 - torch.exp(-lambdas * dt)
+        lambda_total = torch.sum(lambdas, dim=1, keepdim=True)  # (B, 1)
+        lambda_total_safe = torch.clamp(lambda_total, min=1e-12)
 
-    elif loss_type == "lognormal":
+        total_event_prob = 1.0 - torch.exp(-lambda_total_safe * dt)
+        scores = (lambdas / lambda_total_safe) * total_event_prob
+
+        scores = torch.clamp(scores, min=0.0)
+        cap = torch.clamp(total_event_prob, min=0.0, max=1.0)
+        total = torch.sum(scores, dim=1, keepdim=True)
+        scale = torch.where(
+            total > cap, cap / torch.clamp(total, min=1e-12), torch.ones_like(total))
+        scores = scores * scale
+
+        return scores
+
+    if loss_type == "lognormal":
         if loss_fn is None:
             raise ValueError("loss_fn required for lognormal")
+
         coeffs = theta
+        if coeffs.dim() != 3:
+            raise ValueError("lognormal expects theta shaped (B, K, n_basis)")
 
-        # Helper to compute Cumulative Hazard H(t) directly
-        def compute_H(t_vals):
-            if isinstance(t_vals, (float, int)):
-                t_vals = torch.full(
-                    (coeffs.shape[0],), float(t_vals), device=device)
+        B, K, n_basis = coeffs.shape
 
-            # Ensure t > 0
-            t = torch.clamp(t_vals, min=1e-5)
+        def _as_B_vector(v):
+            if isinstance(v, (float, int)):
+                return torch.full((B,), float(v), device=device, dtype=coeffs.dtype)
+            if isinstance(v, torch.Tensor):
+                if v.ndim == 0:
+                    return torch.full((B,), float(v.item()), device=device, dtype=coeffs.dtype)
+                if v.ndim == 1:
+                    return v.to(device=device, dtype=coeffs.dtype)
+                raise ValueError("t_start/t_end must be scalar or (B,) tensor")
+            raise ValueError("t_start/t_end must be scalar or tensor")
 
-            # Gauss-Legendre Quadrature to integrate hazard from 0 to t
-            x_nodes, w = _gauss_legendre_16(device=device, dtype=coeffs.dtype)
+        t_start_vec = _as_B_vector(t_start)
+        t_end_vec = _as_B_vector(t_end)
 
-            # Map nodes from [-1, 1] to [0, t]
-            # u: (B, 16) - time points for integration
-            u = (t.unsqueeze(1) / 2.0) * (x_nodes.unsqueeze(0) + 1.0)
-            weights = (t.unsqueeze(1) / 2.0) * w.unsqueeze(0)
+        t_start_vec = torch.clamp(t_start_vec, min=1e-5)
+        t_end_vec = torch.clamp(t_end_vec, min=1e-5)
+        dt = torch.clamp(t_end_vec - t_start_vec, min=0.0)
 
-            # Calculate hazard at each integration point u
+        x_nodes, w_nodes = _gauss_legendre_16(device=device, dtype=coeffs.dtype)
+
+        def hazards_at_times(t_vals_bm: torch.Tensor) -> torch.Tensor:
+            t = torch.clamp(t_vals_bm, min=1e-5)
+            t_flat = t.reshape(-1)
+            K_flat = loss_fn._compute_kernel(t_flat)  # (B*M, n_basis)
+            K_bm = K_flat.view(t.shape[0], t.shape[1], -1)  # (B, M, n_basis)
+
+            log_h = torch.einsum("bkb,bmb->bkm", coeffs, K_bm)
+            log_h = torch.clamp(log_h, max=20.0)
+            return torch.exp(log_h)  # (B, K, M)
+
+        def H_total(t_vals_bm: torch.Tensor) -> torch.Tensor:
+            t = torch.clamp(t_vals_bm, min=1e-5)
+            B_local, M_local = t.shape
+
+            u = (t.unsqueeze(-1) / 2.0) * \
+                (x_nodes.view(1, 1, -1) + 1.0)  # (B, M, Q)
+            weights = (t.unsqueeze(-1) / 2.0) * \
+                w_nodes.view(1, 1, -1)  # (B, M, Q)
+
             u_flat = u.reshape(-1)
-            K_u_flat = loss_fn._compute_kernel(u_flat)
-            K_u = K_u_flat.view(u.shape[0], u.shape[1], -1)  # (B, 16, n_basis)
+            K_flat = loss_fn._compute_kernel(u_flat)  # (B*M*Q, n_basis)
+            # (B, M, Q, n_basis)
+            K_bmqb = K_flat.view(B_local, M_local, u.shape[-1], -1)
 
-            # Log hazard: sum(coeff * kernel)
-            log_hazards_u = torch.einsum("mkb,mqb->mkq", coeffs, K_u)
-            log_hazards_u = torch.clamp(log_hazards_u, max=20.0)
-            hazards_u = torch.exp(log_hazards_u)
+            log_h = torch.einsum("bkb,bmqb->bkmq", coeffs, K_bmqb)
+            log_h = torch.clamp(log_h, max=20.0)
+            hazards = torch.exp(log_h)  # (B, K, M, Q)
 
-            # Integral = sum(hazard * weight)
-            H = torch.sum(hazards_u * weights.unsqueeze(1), dim=2)  # (B, K)
+            lambda_total = torch.sum(hazards, dim=1)  # (B, M, Q)
+            H = torch.sum(lambda_total * weights, dim=-1)  # (B, M)
             return H
 
-        # 1. Compute Cumulative Hazard from 0 to t_start
-        H_start = compute_H(t_start)
+        Q = x_nodes.numel()
+        dt_half = dt / 2.0
+        u_outer = t_start_vec.unsqueeze(-1) + dt_half.unsqueeze(-1) * \
+            (x_nodes.view(1, -1) + 1.0)  # (B, Q)
+        w_outer = dt_half.unsqueeze(-1) * w_nodes.view(1, -1)  # (B, Q)
 
-        # 2. Compute Cumulative Hazard from 0 to t_end
-        H_end = compute_H(t_end)
+        hazards_k_u = hazards_at_times(u_outer)  # (B, K, Q)
 
-        # 3. Calculate Conditional Risk: 1 - exp( - (H_end - H_start) )
-        # H is strictly increasing, so H_end - H_start >= 0
-        H_interval = torch.clamp(H_end - H_start, min=0.0)
+        H_total_start = H_total(t_start_vec.view(B, 1)).squeeze(1)  # (B,)
+        H_total_end = H_total(t_end_vec.view(B, 1)).squeeze(1)  # (B,)
+        H_total_u = H_total(u_outer)  # (B, Q)
 
-        return 1.0 - torch.exp(-H_interval)
+        delta_H_u = torch.clamp(
+            H_total_u - H_total_start.unsqueeze(-1), min=0.0)
+        S_u = torch.exp(-torch.clamp(delta_H_u, max=60.0))  # (B, Q)
 
-    else:
-        raise ValueError(f"Unknown loss_type: {loss_type}")
+        integrand = hazards_k_u * S_u.unsqueeze(1)  # (B, K, Q)
+        scores = torch.sum(integrand * w_outer.unsqueeze(1), dim=-1)  # (B, K)
+        scores = torch.clamp(scores, min=0.0)
+
+        delta_H_end = torch.clamp(H_total_end - H_total_start, min=0.0)
+        cap = torch.clamp(1.0 - torch.exp(-torch.clamp(delta_H_end,
+                          max=60.0)), min=0.0, max=1.0).unsqueeze(-1)
+        total = torch.sum(scores, dim=1, keepdim=True)
+        scale = torch.where(
+            total > cap, cap / torch.clamp(total, min=1e-12), torch.ones_like(total))
+        scores = scores * scale
+
+        return scores
+
+    raise ValueError(f"Unknown loss_type: {loss_type}")
 
 # =============================================================================
 # Experiment 1: Age-Stratified Evaluation (Dual Metrics)
