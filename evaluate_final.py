@@ -131,9 +131,8 @@ def calculate_conditional_risk(theta, t_start, t_end, loss_type, loss_fn=None):
 
         num = F_end - F_start
         num = torch.clamp(num, min=0.0)
-        denom = 1.0 - F_start
 
-        return num / denom
+        return num
 
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}")
