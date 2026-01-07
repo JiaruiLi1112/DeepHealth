@@ -124,7 +124,7 @@ def calculate_risk_score(theta, t_start, t_end, loss_type, loss_fn=None):
             K_flat = loss_fn._compute_kernel(t_flat)  # (B*M, n_basis)
             K_bm = K_flat.view(t.shape[0], t.shape[1], -1)  # (B, M, n_basis)
 
-            log_h = torch.einsum("bkb,bmb->bkm", coeffs, K_bm)
+            log_h = torch.einsum("bkn,bmn->bkm", coeffs, K_bm)
             log_h = torch.clamp(log_h, max=20.0)
             return torch.exp(log_h)  # (B, K, M)
 
@@ -142,7 +142,7 @@ def calculate_risk_score(theta, t_start, t_end, loss_type, loss_fn=None):
             # (B, M, Q, n_basis)
             K_bmqb = K_flat.view(B_local, M_local, u.shape[-1], -1)
 
-            log_h = torch.einsum("bkb,bmqb->bkmq", coeffs, K_bmqb)
+            log_h = torch.einsum("bkn,bmqn->bkmq", coeffs, K_bmqb)
             log_h = torch.clamp(log_h, max=20.0)
             hazards = torch.exp(log_h)  # (B, K, M, Q)
 
