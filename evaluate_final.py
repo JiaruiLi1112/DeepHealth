@@ -2,34 +2,30 @@ from losses import LogNormalBasisHazardLoss, ExponentialNLLLoss, _gauss_legendre
 from model import DelphiFork, SapDelphi
 from dataset import HealthDataset, health_collate_fn
 import os
-import argparse
 import sys
 import json
 import math
+import argparse
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, random_split
-from collections import defaultdict
 from sklearn.metrics import roc_auc_score
-from lifelines.utils import concordance_index
-from tqdm import tqdm  # Added for progress tracking
+from collections import defaultdict
+from tqdm import tqdm
 
-# Add current directory to path so we can import modules
+# Ensure local modules can be imported
 sys.path.append(os.getcwd())
 
 
 # =============================================================================
-# Helper Functions for Evaluation
+# Utility Functions
 # =============================================================================
 
 
 def load_labels(labels_file="labels.csv"):
-    """
-    Load disease labels mapping ID -> Name.
-    ID starts at 2 (0=pad, 1=DOA).
-    """
+    """Load mapping from Disease ID to Name."""
     labels_map = {}
     if not os.path.exists(labels_file):
         return labels_map
@@ -37,105 +33,122 @@ def load_labels(labels_file="labels.csv"):
         for idx, line in enumerate(f):
             parts = line.strip()
             if parts:
+                # ID starts at 2 (0=PAD, 1=DOA)
                 labels_map[idx + 2] = parts
     return labels_map
 
 
+def get_chapter(code_str):
+    """Map disease name/code to ICD-10 Chapter."""
+    if not code_str:
+        return "Unknown"
+    # Simple heuristic mapping based on first letter
+    letter = code_str[0].upper()
+    mapping = {
+        'A': "I: Infectious", 'B': "I: Infectious",
+        'C': "II: Neoplasms", 'D': "III: Blood/Immune",
+        'E': "IV: Metabolic", 'F': "V: Mental",
+        'G': "VI: Nervous", 'H': "VII/VIII: Eye/Ear",
+        'I': "IX: Circulatory", 'J': "X: Respiratory",
+        'K': "XI: Digestive", 'L': "XII: Skin",
+        'M': "XIII: Musculoskeletal", 'N': "XIV: Genitourinary",
+        'O': "XV: Pregnancy", 'P': "XVI: Perinatal",
+        'Q': "XVII: Congenital", 'R': "XVIII: Symptoms",
+        'S': "XIX: Injury", 'T': "XIX: Injury",
+        'Z': "XXI: Factors"
+    }
+    # Special handling for "Death" if it's explicitly named
+    if "Death" in code_str:
+        return "Death"
+    return mapping.get(letter, "Other")
+
+
 def calculate_conditional_risk(theta, t_start, t_end, loss_type, loss_fn=None):
     """
-    Calculate P(t_start < T <= t_end | T > t_start) using CDF strictly.
+    Calculate P(t_start < T <= t_end | T > t_start).
+    This assumes t_start and t_end are relative to the last observed event.
     Formula: (F(t_end) - F(t_start)) / (1 - F(t_start))
     """
     device = theta.device
 
     if loss_type == "exponential":
+        # theta is logits -> lambda = softplus(logits)
         logits = theta
         if logits.dim() == 3:
             logits = logits.squeeze(-1)
-
         lambdas = F.softplus(logits)  # (B, K)
 
         dt = t_end - t_start
         if isinstance(dt, torch.Tensor) and dt.ndim == 1:
             dt = dt.unsqueeze(-1)  # (B, 1)
 
+        # For exponential, hazard is constant, so conditional prob depends only on dt
         risk = 1.0 - torch.exp(-lambdas * dt)
         return risk
 
     elif loss_type == "lognormal":
         if loss_fn is None:
-            raise ValueError(
-                "loss_fn must be provided for lognormal conditional risk")
+            raise ValueError("loss_fn required for lognormal risk")
 
         coeffs = theta  # (B, K, n_basis)
 
         def compute_F(t_vals):
-            # t_vals: (B,) or scalar broadcasted
+            # Broadcast t_vals to (B,)
             if isinstance(t_vals, float):
                 t_vals = torch.full((coeffs.shape[0],), t_vals, device=device)
 
-            t = torch.clamp(t_vals, min=loss_fn.eps)
+            # Clamp for numerical stability
+            t = torch.clamp(t_vals, min=1e-5)
 
-            # Integration for H(t)
-            x_nodes, w = _gauss_legendre_16(
-                device=device, dtype=coeffs.dtype)  # (16,)
+            # Gauss-Legendre Integration for Cumulative Hazard H(t)
+            x_nodes, w = _gauss_legendre_16(device=device, dtype=coeffs.dtype)
 
-            u = (t.unsqueeze(1) / 2.0) * (x_nodes.unsqueeze(0) + 1.0)
-            weights = (t.unsqueeze(1) / 2.0) * w.unsqueeze(0)  # (B, 16)
+            # Map [-1, 1] to [0, t]
+            u = (t.unsqueeze(1) / 2.0) * (x_nodes.unsqueeze(0) + 1.0)  # (B, 16)
+            weights = (t.unsqueeze(1) / 2.0) * w.unsqueeze(0)         # (B, 16)
 
             u_flat = u.reshape(-1)
             K_u_flat = loss_fn._compute_kernel(u_flat)
-            K_u = K_u_flat.view(u.shape[0], u.shape[1], -1)
+            K_u = K_u_flat.view(u.shape[0], u.shape[1], -1)  # (B, 16, n_basis)
 
+            # log_lambda(u)
             log_hazards_u = torch.einsum("mkb,mqb->mkq", coeffs, K_u)
             log_hazards_u = torch.clamp(log_hazards_u, max=20.0)
-            hazards_u = torch.exp(log_hazards_u)
+            hazards_u = torch.exp(log_hazards_u)  # (B, K, 16)
 
+            # Integrate -> H(t)
             H = torch.sum(hazards_u * weights.unsqueeze(1), dim=2)  # (B, K)
 
             # F(t) = 1 - exp(-H(t))
-            F = 1.0 - torch.exp(-H)
-            return F
+            return 1.0 - torch.exp(-H)
 
         F_start = compute_F(t_start)
         F_end = compute_F(t_end)
 
-        # Formula: (F(te) - F(ts)) / (1 - F(ts))
-        # Clamp F_start < 1.0 slightly to avoid division by zero
+        # Conditional Probability Formula
+        # Clamp F_start to avoid division by zero
         F_start = torch.clamp(F_start, max=1.0 - 1e-7)
 
-        # Numerator
         num = F_end - F_start
-        num = torch.clamp(num, min=0.0)  # Ensure non-negative probability
-
+        num = torch.clamp(num, min=0.0)
         denom = 1.0 - F_start
 
-        risk = num / denom
-        return risk
+        return num / denom
 
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}")
 
+# =============================================================================
+# Experiment 1: Age-Stratified Evaluation
+# =============================================================================
 
-# =============================================================================
-# Experiment Runners
-# =============================================================================
 
 def run_stratified_evaluation(dataset, model, loss_fn, args, disease_map):
-    print("\n>>> Starting Experiment 1: Age-Stratified Evaluation")
+    print("\n" + "="*50)
+    print(">>> Experiment 1: Age-Stratified Evaluation")
+    print("="*50)
 
-    age_buckets = [40, 45, 50, 55, 60, 65, 70, 75, 80]
-    results = []
-
-    # Identify Death Code from map
-    death_id = None
-    for k, v in disease_map.items():
-        if v == "Death":
-            death_id = k
-            break
-    print(f"Death ID identified as: {death_id}")
-
-    # Handle Subset or original Dataset
+    # 1. Setup Metadata for fast filtering
     if isinstance(dataset, Subset):
         base_dataset = dataset.dataset
         def get_real_idx(i): return dataset.indices[i]
@@ -143,67 +156,72 @@ def run_stratified_evaluation(dataset, model, loss_fn, args, disease_map):
         base_dataset = dataset
         def get_real_idx(i): return i
 
-    # Pre-select patients for efficiency
     print("Pre-scanning patient metadata...")
     patient_meta = []
-    for i in range(len(dataset)):
-        real_idx = get_real_idx(i)
-        pid = base_dataset.patient_ids[real_idx]
-        events = sorted(base_dataset.patient_events[pid], key=lambda x: x[0])
-        ts = [x[0]/365.25 for x in events]
-        es = [x[1] for x in events]
+    # Find Death ID
+    death_id = None
+    for k, v in disease_map.items():
+        if "Death" in v or "death" in v:
+            death_id = k
+            break
 
-        death_time = None
+    for i in range(len(dataset)):
+        pid = base_dataset.patient_ids[get_real_idx(i)]
+        events = base_dataset.patient_events[pid]  # list of (time, code)
+        if not events:
+            patient_meta.append(
+                {'idx': i, 'max_time_yr': 0, 'death_time_yr': None})
+            continue
+
+        # Sort by time
+        events = sorted(events, key=lambda x: x[0])
+        max_time_yr = events[-1][0] / 365.25
+
+        d_time = None
         if death_id is not None:
-            for t_val, e_code in zip(ts, es):
-                if e_code == death_id:
-                    death_time = t_val
+            for t, c in events:
+                if c == death_id:
+                    d_time = t / 365.25
                     break
 
         patient_meta.append({
             'idx': i,
-            'max_time': ts[-1] if ts else 0,
-            'death_time': death_time,
-            'events': list(zip(ts, es))
+            'max_time_yr': max_time_yr,
+            'death_time_yr': d_time
         })
 
-    def get_chapter(code_str):
-        if not code_str:
-            return "Unknown"
-        letter = code_str[0].upper()
-        # Simple mapping
-        if letter in ['A', 'B']:
-            return "I: Infections"
-        if letter == 'C':
-            return "II: Neoplasms"
-        if letter == 'I':
-            return "IX: Circulatory"
-        if letter == 'J':
-            return "X: Respiratory"
-        if letter == 'K':
-            return "XI: Digestive"
-        return "Other"
+    age_buckets = [40, 45, 50, 55, 60, 65, 70, 75, 80]
+    results = []
 
     for age in age_buckets:
         t_start = float(age)
-        t_target_start = t_start + 0.5  # 0.5 year gap
-        t_target_end = t_start + 5.0
+        t_gap = 0.5
+        t_horizon = 5.0
+        t_end_window = t_start + t_horizon
 
+        # 2. Strict Filtering (Censoring Handling)
+        # Patient must be alive at start AND (followed up until end OR died within window)
         eligible_indices = []
         for pm in patient_meta:
-            # 1. Alive at t_start
-            if pm['death_time'] is not None and pm['death_time'] <= t_start:
+            # Must be alive at start
+            if pm['death_time_yr'] is not None and pm['death_time_yr'] <= t_start:
                 continue
-            # 2. Followed up until end OR died after t_start
-            is_followed_up = pm['max_time'] >= t_target_end
-            if is_followed_up or (pm['death_time'] is not None and pm['death_time'] > t_start):
+
+            # Check censoring
+            # Condition: Max observation >= End of Window OR Death happened during window
+            has_sufficient_followup = pm['max_time_yr'] >= t_end_window
+            died_in_window = (pm['death_time_yr'] is not None) and (
+                pm['death_time_yr'] <= t_end_window)
+
+            if has_sufficient_followup or died_in_window:
                 eligible_indices.append(pm['idx'])
 
-        if not eligible_indices:
-            print(f"Age {age}: No eligible patients.")
+        if len(eligible_indices) < 50:
+            print(
+                f"Age {age}: Skipped (insufficient samples: {len(eligible_indices)})")
             continue
 
-        print(f"Age {age}: {len(eligible_indices)} patients.")
+        print(f"Age {age}: Evaluating on {len(eligible_indices)} patients...")
 
         loader = DataLoader(
             Subset(dataset, eligible_indices),
@@ -214,144 +232,177 @@ def run_stratified_evaluation(dataset, model, loss_fn, args, disease_map):
 
         all_risks = []
         all_targets = []
+        all_prevalence = []
 
         with torch.no_grad():
-            for batch in tqdm(loader, desc=f"Evaluating Age {age}"):
+            for batch in tqdm(loader, desc=f"Age {age} Inference", leave=False):
                 event_batch, time_batch, cont_batch, cate_batch, sex_batch = batch
 
+                # Truncate at t_start
                 limit_days = t_start * 365.25
+                target_start_days = (t_start + t_gap) * 365.25
+                target_end_days = (t_start + t_horizon) * 365.25
+
                 new_event_seqs = []
                 new_time_seqs = []
                 batch_targets = []
-
-                B_curr = event_batch.shape[0]
+                batch_prevalence = []
                 kept_indices = []
 
-                for k in range(B_curr):
+                B = event_batch.shape[0]
+                for k in range(B):
+                    # Get valid sequence
                     valid_len = (event_batch[k] != 0).sum().item()
                     e_seq = event_batch[k, :valid_len]
                     t_seq = time_batch[k, :valid_len]
 
-                    mask = t_seq <= limit_days
-                    t_trunc = t_seq[mask]
-                    e_trunc = e_seq[mask]
+                    # 1. Truncate History (Input)
+                    mask_input = t_seq <= limit_days
+                    t_trunc = t_seq[mask_input]
+                    e_trunc = e_seq[mask_input]
 
                     if len(t_trunc) == 0:
                         continue
 
-                    kept_indices.append(k)
-                    new_event_seqs.append(e_trunc)
-                    new_time_seqs.append(t_trunc)
-
-                    target_start_days = t_target_start * 365.25
-                    target_end_days = t_target_end * 365.25
-
-                    in_window_mask = (t_seq > target_start_days) & (
+                    # 2. Define Target (Future Events)
+                    # Strictly inside (Age + 0.5, Age + 5.0]
+                    mask_target = (t_seq > target_start_days) & (
                         t_seq <= target_end_days)
-                    target_events = e_seq[in_window_mask].tolist()
+                    target_codes = e_seq[mask_target].tolist()
 
                     tgt_vec = np.zeros(base_dataset.n_disease, dtype=float)
-                    for eid in target_events:
-                        if eid >= 2:
-                            idx_in_vec = eid - 2
-                            if idx_in_vec < base_dataset.n_disease:
-                                tgt_vec[idx_in_vec] = 1.0
-                    batch_targets.append(tgt_vec)
+                    for c in target_codes:
+                        if c >= 2:
+                            tgt_vec[c - 2] = 1.0
 
-                if len(new_event_seqs) == 0:
+                    # 3. Compute Prevalence (History)
+                    # Identify diseases present in input history
+                    prev_vec = np.zeros(base_dataset.n_disease, dtype=bool)
+                    for c in e_trunc:
+                        if c >= 2:
+                            prev_vec[c - 2] = True
+
+                    new_event_seqs.append(e_trunc)
+                    new_time_seqs.append(t_trunc)
+                    batch_targets.append(tgt_vec)
+                    batch_prevalence.append(prev_vec)
+                    kept_indices.append(k)
+
+                if not new_event_seqs:
                     continue
 
+                # Prepare Model Inputs
                 from torch.nn.utils.rnn import pad_sequence
                 event_in = pad_sequence(
                     new_event_seqs, batch_first=True, padding_value=0).to(args.device)
                 time_in = pad_sequence(
                     new_time_seqs, batch_first=True, padding_value=36525.0).to(args.device)
 
-                kept_indices_tensor = torch.tensor(
+                kept_tensor = torch.tensor(
                     kept_indices, device=cont_batch.device)
-                cont_in = cont_batch[kept_indices_tensor].to(args.device)
-                cate_in = cate_batch[kept_indices_tensor].to(args.device)
-                sex_in = sex_batch[kept_indices_tensor].to(args.device)
+                cont_in = cont_batch[kept_tensor].to(args.device)
+                cate_in = cate_batch[kept_tensor].to(args.device)
+                sex_in = sex_batch[kept_tensor].to(args.device)
 
-                lengths = torch.tensor(
-                    [len(x) for x in new_event_seqs], device=args.device)
                 b_prev = torch.arange(len(new_event_seqs), device=args.device)
-                t_prev = lengths - 1
+                t_prev = torch.tensor(
+                    [len(x)-1 for x in new_event_seqs], device=args.device)
 
+                # Forward Pass
                 theta = model(event_in, time_in, sex_in, cont_in,
                               cate_in, b_prev=b_prev, t_prev=t_prev)
                 theta = theta.view(len(new_event_seqs),
-                                   base_dataset.n_disease, model.n_dim)
+                                   base_dataset.n_disease, -1)
 
-                # Correct Time Logic: Predict window relative to t_last
-                last_times_days = torch.tensor(
+                # Time Logic (Relative to Last Event)
+                last_times = torch.tensor(
                     [t[-1] for t in new_time_seqs], device=args.device)
-                anchor_days = limit_days
-                gap_days = anchor_days - last_times_days
-                gap_years = gap_days / 365.25
+                last_ages_years = last_times / 365.25
 
-                risk_t_start = gap_years + 0.5
-                risk_t_end = gap_years + 5.0
+                # Gap = Anchor Age - Last Event Age
+                gap_years = t_start - last_ages_years
+                gap_years = torch.clamp(gap_years, min=0.0)  # Safety
+
+                # Prediction Interval: [Gap + 0.5, Gap + 5.0]
+                risk_t_start = gap_years + t_gap
+                risk_t_end = gap_years + t_horizon
 
                 risks = calculate_conditional_risk(
-                    theta, t_start=risk_t_start, t_end=risk_t_end,
-                    loss_type=loss_type, loss_fn=loss_fn
+                    theta, risk_t_start, risk_t_end, args.loss_type, loss_fn
                 )
 
                 all_risks.append(risks.cpu().numpy())
                 all_targets.append(np.array(batch_targets))
+                all_prevalence.append(np.array(batch_prevalence))
 
         if not all_risks:
             continue
 
         all_risks = np.concatenate(all_risks, axis=0)
         all_targets = np.concatenate(all_targets, axis=0)
+        all_prevalence = np.concatenate(all_prevalence, axis=0)
 
-        # Metrics
-        auc_scores = {}
+        # Compute AUCs with Prevalence Masking
+        auc_dict = {}
         for d_idx in range(base_dataset.n_disease):
-            y_true = all_targets[:, d_idx]
-            y_score = all_risks[:, d_idx]
-            if np.sum(y_true) < 5:
+            # Only evaluate on patients who DO NOT have this disease in history
+            at_risk_mask = ~all_prevalence[:, d_idx]
+
+            y_true = all_targets[at_risk_mask, d_idx]
+            y_score = all_risks[at_risk_mask, d_idx]
+
+            # Need at least one class 0 and one class 1
+            if len(y_true) < 10 or np.sum(y_true) < 1 or np.sum(y_true) == len(y_true):
                 continue
+
             try:
-                auc = roc_auc_score(y_true, y_score)
-                auc_scores[d_idx] = auc
+                auc_dict[d_idx] = roc_auc_score(y_true, y_score)
             except:
                 pass
 
-        valid_aucs = list(auc_scores.values())
+        # Aggregate Metrics
+        valid_aucs = list(auc_dict.values())
         mean_auc = np.mean(valid_aucs) if valid_aucs else 0.0
-        print(f"Age {age} Mean AUC: {mean_auc:.4f}")
 
-        res_row = {'Age': age, 'Mean_AUC': mean_auc,
-                   'N_Patients': len(eligible_indices)}
+        row = {
+            "Age": age,
+            "N_Patients": len(eligible_indices),
+            "Mean_AUC": mean_auc
+        }
 
-        # Chapter Stats
-        chapter_aucs = defaultdict(list)
-        for d_idx, auc in auc_scores.items():
-            name = disease_map.get(d_idx + 2, "Unknown")
+        # Aggregation by Chapter
+        chap_scores = defaultdict(list)
+        for d_idx, auc_val in auc_dict.items():
+            name = disease_map.get(d_idx+2, "Unknown")
             chap = get_chapter(name)
-            chapter_aucs[chap].append(auc)
-        for chap, aucs in chapter_aucs.items():
-            res_row[f"Chapter_{chap}_AUC"] = np.mean(aucs)
+            chap_scores[chap].append(auc_val)
 
-        results.append(res_row)
+        for chap, scores in chap_scores.items():
+            row[f"AUC_{chap}"] = np.mean(scores)
 
-    df_res = pd.DataFrame(results)
+        results.append(row)
+        print(f"  -> Mean AUC: {mean_auc:.4f}")
+
+    # Save
+    df = pd.DataFrame(results)
     out_path = os.path.join(args.run_dir, "results_exp1_stratified.csv")
-    df_res.to_csv(out_path, index=False)
-    print(f"Saved {out_path}")
+    df.to_csv(out_path, index=False)
+    print(f"Saved stratified results to {out_path}")
 
+
+# =============================================================================
+# Experiment 2: Age-60 Landmark Analysis
+# =============================================================================
 
 def run_landmark_analysis(dataset, model, loss_fn, args):
-    print("\n>>> Starting Experiment 2: Age-60 Landmark Analysis")
+    print("\n" + "="*50)
+    print(">>> Experiment 2: Age-60 Landmark Analysis")
+    print("="*50)
 
     t_landmark = 60.0
     limit_days = t_landmark * 365.25
-    # Enforce 1-year gap for target definition
-    gap_years_for_target = 1.0
-    start_target_days = (t_landmark + gap_years_for_target) * 365.25
+    gap_years = 1.0  # 1-Year Blanking
+    min_future_days = (t_landmark + gap_years) * 365.25
 
     if isinstance(dataset, Subset):
         base_dataset = dataset.dataset
@@ -360,19 +411,17 @@ def run_landmark_analysis(dataset, model, loss_fn, args):
         base_dataset = dataset
         def get_real_idx(i): return i
 
+    # Filter: Must have data beyond 61 years
     eligible_indices = []
-    # Filter: Must have events AFTER the gap (Age > 61)
     for i in range(len(dataset)):
-        real_idx = get_real_idx(i)
-        pid = base_dataset.patient_ids[real_idx]
+        pid = base_dataset.patient_ids[get_real_idx(i)]
         events = base_dataset.patient_events[pid]
-        # Check if any event occurs after 61 years
-        has_future = any(x[0] > start_target_days for x in events)
-        if has_future:
+        # Check if max time > 61 years
+        if events and events[-1][0] > min_future_days:
             eligible_indices.append(i)
 
-    print(f"Found {len(eligible_indices)} patients for landmark analysis.")
-    if len(eligible_indices) == 0:
+    print(f"Found {len(eligible_indices)} patients eligible (Follow-up > 61y).")
+    if not eligible_indices:
         return
 
     loader = DataLoader(
@@ -383,221 +432,240 @@ def run_landmark_analysis(dataset, model, loss_fn, args):
     )
 
     horizons = [5, 10, 20]
-    calibration_data = {h: [] for h in horizons}
-    ranking_data = {h: [] for h in horizons}
 
-    all_pred_risks = {h: [] for h in horizons}
-    all_true_outcomes = {h: [] for h in horizons}
+    # Store predictions and targets for all patients
+    # Use lists to accumulate batches
+    collated_preds = {h: [] for h in horizons}
+    collated_targets = {h: [] for h in horizons}
+    collated_prevalence = []
 
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Landmark Analysis"):
+        for batch in tqdm(loader, desc="Landmark Inference"):
             event_batch, time_batch, cont_batch, cate_batch, sex_batch = batch
+
             new_event_seqs = []
             new_time_seqs = []
-            batch_targets = {h: [] for h in horizons}
-
-            B_curr = event_batch.shape[0]
             kept_indices = []
-            for k in range(B_curr):
+
+            batch_targets = {h: [] for h in horizons}
+            batch_prev = []
+
+            B = event_batch.shape[0]
+            for k in range(B):
                 valid_len = (event_batch[k] != 0).sum().item()
                 e_seq = event_batch[k, :valid_len]
                 t_seq = time_batch[k, :valid_len]
 
-                mask = t_seq <= limit_days
-                t_trunc = t_seq[mask]
-                e_trunc = e_seq[mask]
+                # 1. Input: Truncate at 60.0
+                mask_in = t_seq <= limit_days
+                e_trunc = e_seq[mask_in]
+                t_trunc = t_seq[mask_in]
 
                 if len(t_trunc) == 0:
                     continue
-                kept_indices.append(k)
-                new_event_seqs.append(e_trunc)
-                new_time_seqs.append(t_trunc)
+
+                # 2. Prevalence Mask (History up to 60)
+                prev_vec = np.zeros(base_dataset.n_disease, dtype=bool)
+                for c in e_trunc:
+                    if c >= 2:
+                        prev_vec[c - 2] = True
+
+                # 3. Targets for each horizon
+                # Window: (61.0, 60.0 + H]
+                start_days = min_future_days
 
                 for h in horizons:
-                    # Target: Events between (61, 60+H]
-                    h_days = (t_landmark + h) * 365.25
-                    in_window = (t_seq > start_target_days) & (t_seq <= h_days)
-                    tgt_codes = e_seq[in_window].tolist()
+                    end_days = (t_landmark + h) * 365.25
+                    mask_tgt = (t_seq > start_days) & (t_seq <= end_days)
+                    tgt_codes = e_seq[mask_tgt].tolist()
 
-                    vec = np.zeros(base_dataset.n_disease, dtype=float)
+                    tgt_vec = np.zeros(base_dataset.n_disease, dtype=float)
                     for c in tgt_codes:
-                        if c >= 2 and c-2 < base_dataset.n_disease:
-                            vec[c-2] = 1.0
-                    batch_targets[h].append(vec)
+                        if c >= 2:
+                            tgt_vec[c - 2] = 1.0
+                    batch_targets[h].append(tgt_vec)
 
-            if len(new_event_seqs) == 0:
+                new_event_seqs.append(e_trunc)
+                new_time_seqs.append(t_trunc)
+                batch_prev.append(prev_vec)
+                kept_indices.append(k)
+
+            if not new_event_seqs:
                 continue
 
+            # Model Forward
             from torch.nn.utils.rnn import pad_sequence
             event_in = pad_sequence(
-                new_event_seqs, batch_first=True, padding_value=0).to(args.device)
+                new_event_seqs, batch_first=True).to(args.device)
             time_in = pad_sequence(
                 new_time_seqs, batch_first=True, padding_value=36525.0).to(args.device)
 
-            kept_indices_tensor = torch.tensor(
-                kept_indices, device=cont_batch.device)
-            cont_in = cont_batch[kept_indices_tensor].to(args.device)
-            cate_in = cate_batch[kept_indices_tensor].to(args.device)
-            sex_in = sex_batch[kept_indices_tensor].to(args.device)
+            kept_t = torch.tensor(kept_indices, device=cont_batch.device)
+            cont_in = cont_batch[kept_t].to(args.device)
+            cate_in = cate_batch[kept_t].to(args.device)
+            sex_in = sex_batch[kept_t].to(args.device)
 
-            lengths = torch.tensor([len(x)
-                                   for x in new_event_seqs], device=args.device)
             b_prev = torch.arange(len(new_event_seqs), device=args.device)
-            t_prev = lengths - 1
+            t_prev = torch.tensor(
+                [len(x)-1 for x in new_event_seqs], device=args.device)
 
             theta = model(event_in, time_in, sex_in, cont_in,
                           cate_in, b_prev=b_prev, t_prev=t_prev)
-            theta = theta.view(len(new_event_seqs),
-                               base_dataset.n_disease, model.n_dim)
+            theta = theta.view(len(new_event_seqs), base_dataset.n_disease, -1)
 
-            # Calculation:
-            # 1. Calc gap from last event to 60.
-            # 2. Add 1.0 year gap for prediction start.
-            last_times_days = torch.tensor(
+            # Time Logic:
+            # We want to predict event in absolute window [61, 60+H]
+            # Input last event time: t_last
+            # Gap relative to t_last: (60 - t_last)
+            # Prediction Start relative to t_last: (60 - t_last) + 1.0
+            # Prediction End relative to t_last: (60 - t_last) + H
+
+            last_times = torch.tensor(
                 [t[-1] for t in new_time_seqs], device=args.device)
-            gap_days = limit_days - last_times_days
-            gap_years = gap_days / 365.25
+            last_ages = last_times / 365.25
+            gap_to_60 = t_landmark - last_ages
+            gap_to_60 = torch.clamp(gap_to_60, min=0.0)
+
+            collated_prevalence.append(np.array(batch_prev))
 
             for h in horizons:
-                # Prediction Window: [Gap + 1.0, Gap + H]
-                # Corresponds to absolute age [61, 60+H]
-                risk_t_start = gap_years + 1.0
-                risk_t_end = gap_years + float(h)
+                t_rel_start = gap_to_60 + gap_years
+                t_rel_end = gap_to_60 + float(h)
 
                 risks = calculate_conditional_risk(
-                    theta, t_start=risk_t_start, t_end=risk_t_end,
-                    loss_type=loss_type, loss_fn=loss_fn)
+                    theta, t_rel_start, t_rel_end, args.loss_type, loss_fn
+                )
 
-                all_pred_risks[h].append(risks.cpu().numpy())
-                all_true_outcomes[h].append(np.array(batch_targets[h]))
+                collated_preds[h].append(risks.cpu().numpy())
+                collated_targets[h].append(np.array(batch_targets[h]))
+
+    # Compute Metrics
+    final_prevalence = np.concatenate(collated_prevalence, axis=0)  # (N, K)
+
+    cal_results = []
+    rank_results = []
 
     for h in horizons:
-        if not all_pred_risks[h]:
+        if not collated_preds[h]:
             continue
-        preds = np.concatenate(all_pred_risks[h], axis=0)
-        trues = np.concatenate(all_true_outcomes[h], axis=0)
 
-        total_expected = np.sum(preds)
-        total_observed = np.sum(trues)
-        eo_ratio = total_expected / (total_observed + 1e-8)
+        preds = np.concatenate(collated_preds[h], axis=0)  # (N, K)
+        trues = np.concatenate(collated_targets[h], axis=0)  # (N, K)
 
-        print(f"Horizon {h} Years: E/O Ratio = {eo_ratio:.4f}")
+        # 1. Global Calibration (E/O Ratio)
+        # Sum expected risk vs Sum observed events
+        # IMPORTANT: Only count people AT RISK (not prevalent)
+        # Or typically E/O includes everyone?
+        # Standard E/O usually includes everyone, but if we mask predictions for prevalent cases,
+        # we should also mask observations (which are 0 anyway).
 
-        calibration_data[h] = {
-            'mean_pred': np.mean(preds), 'mean_obs': np.mean(trues), 'eo_ratio': eo_ratio
-        }
+        # Let's apply prevalence masking to Predictions for E/O as well to be consistent
+        # Mask: if prevalent, we set pred=0 (or ignore).
+        # Since 'trues' is 0 for prevalent cases, this is safe.
 
-        ks = [10, 20]
-        recalls = {k: [] for k in ks}
-        precisions = {k: [] for k in ks}
+        preds_masked = preds.copy()
+        preds_masked[final_prevalence] = 0.0
+
+        E = np.sum(preds_masked)
+        O = np.sum(trues)
+        eo = E / (O + 1e-8)
+
+        print(f"Horizon {h}: E/O = {eo:.4f}")
+        cal_results.append({'Horizon': h, 'Expected': E,
+                           'Observed': O, 'EO_Ratio': eo})
+
+        # 2. Ranking Metrics (Recall@K, Precision@K)
+        # For each patient, rank diseases by risk.
+        # EXCLUDE prevalent diseases from candidates (set risk to -1)
+
+        preds_for_ranking = preds.copy()
+        preds_for_ranking[final_prevalence] = -1.0
+
+        recalls_10, precisions_10 = [], []
+        recalls_20, precisions_20 = [], []
 
         for i in range(preds.shape[0]):
-            p_row = preds[i]
-            t_row = trues[i]
-            relevant_indices = np.where(t_row > 0)[0]
-            if len(relevant_indices) == 0:
-                continue
+            true_indices = np.where(trues[i] > 0)[0]
+            if len(true_indices) == 0:
+                continue  # Patient had no events in window
 
-            sorted_indices = np.argsort(p_row)[::-1]
-            for k in ks:
-                top_k = sorted_indices[:k]
-                hits = np.isin(top_k, relevant_indices).sum()
-                recalls[k].append(hits / len(relevant_indices))
-                precisions[k].append(hits / k)
+            # Sort desc
+            sorted_indices = np.argsort(preds_for_ranking[i])[::-1]
 
-        avg_recalls = {k: np.mean(v) if v else 0.0 for k, v in recalls.items()}
-        avg_precisions = {k: np.mean(
-            v) if v else 0.0 for k, v in precisions.items()}
+            # Top 10
+            top10 = sorted_indices[:10]
+            hits10 = np.isin(top10, true_indices).sum()
+            recalls_10.append(hits10 / len(true_indices))
+            precisions_10.append(hits10 / 10.0)
 
-        print(
-            f"Horizon {h} Recall@10: {avg_recalls[10]:.4f}, Precision@10: {avg_precisions[10]:.4f}")
+            # Top 20
+            top20 = sorted_indices[:20]
+            hits20 = np.isin(top20, true_indices).sum()
+            recalls_20.append(hits20 / len(true_indices))
+            precisions_20.append(hits20 / 20.0)
 
-        ranking_row = {
-            'Horizon': h, 'EO_Ratio': eo_ratio,
-            'Recall_10': avg_recalls[10], 'Precision_10': avg_precisions[10],
-            'Recall_20': avg_recalls[20], 'Precision_20': avg_precisions[20]
-        }
-        ranking_data[h] = ranking_row
+        rank_results.append({
+            'Horizon': h,
+            'Recall_10': np.mean(recalls_10), 'Precision_10': np.mean(precisions_10),
+            'Recall_20': np.mean(recalls_20), 'Precision_20': np.mean(precisions_20)
+        })
 
-    df_cal = pd.DataFrame([calibration_data[h] for h in horizons])
-    df_cal['Horizon'] = horizons
-    cal_path = os.path.join(args.run_dir, "results_exp2_calibration.csv")
-    df_cal.to_csv(cal_path, index=False)
-
-    df_rank = pd.DataFrame([ranking_data[h] for h in horizons])
-    rank_path = os.path.join(args.run_dir, "results_exp2_ranking.csv")
-    df_rank.to_csv(rank_path, index=False)
-    print(f"Saved {rank_path}")
+    # Save
+    pd.DataFrame(cal_results).to_csv(os.path.join(
+        args.run_dir, "results_exp2_calibration.csv"), index=False)
+    pd.DataFrame(rank_results).to_csv(os.path.join(
+        args.run_dir, "results_exp2_ranking.csv"), index=False)
+    print("Saved landmark results.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_dir", type=str, required=True)
-    parser.add_argument("--loss_type", type=str,
-                        choices=['lognormal', 'exponential'], default=None)
+    parser.add_argument("--loss_type", type=str, default=None)
     parser.add_argument("--device", type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch_size", type=int, default=32)
     args = parser.parse_args()
 
-    config_path = os.path.join(args.run_dir, "train_config.json")
-    with open(config_path, "r") as f:
-        cfg_dict = json.load(f)
-    print(f"Loaded config from {args.run_dir}")
+    # Load Config
+    cfg_path = os.path.join(args.run_dir, "train_config.json")
+    with open(cfg_path, "r") as f:
+        cfg = json.load(f)
 
-    loss_type = args.loss_type or cfg_dict.get("loss_type")
-    if not loss_type:
-        raise ValueError("loss_type not found in config/args.")
-    print(f"Inferred loss_type: {loss_type}")
+    args.loss_type = args.loss_type or cfg.get("loss_type", "lognormal")
+    print(f"Run: {args.run_dir}, Loss: {args.loss_type}, Device: {args.device}")
 
-    data_prefix = cfg_dict.get("data_prefix", "ukb")
-    cov_list = None if cfg_dict.get("full_cov", False) else [
-        "bmi", "smoking", "alcohol"]
-
-    print("Loading dataset...")
-    if not os.path.exists(f"{data_prefix}_basic_info.csv"):
-        print(f"Error: {data_prefix}_basic_info.csv not found.")
-        sys.exit(1)
-
-    dataset = HealthDataset(data_prefix=data_prefix, covariate_list=cov_list)
-    print(f"Full Dataset size: {len(dataset)}")
-
-    # Split (Same seed as train.py)
-    n_total = len(dataset)
-    train_ratio = cfg_dict.get("train_ratio", 0.7)
-    val_ratio = cfg_dict.get("val_ratio", 0.15)
-    test_ratio = 1.0 - train_ratio - val_ratio
-
-    # Calc lengths
-    train_len = int(n_total * train_ratio)
-    val_len = int(n_total * val_ratio)
-    test_len = n_total - train_len - val_len
-
-    _, _, eval_dataset = random_split(
-        dataset, [train_len, val_len, test_len],
-        generator=torch.Generator().manual_seed(cfg_dict.get("random_seed", 42))
-    )
-    print(f"Using test split with {len(eval_dataset)} samples.")
-
+    # Load Model
     n_dim = 1
     loss_fn = None
+    if args.loss_type == "exponential":
+        loss_fn = ExponentialNLLLoss()
+    elif args.loss_type == "lognormal":
+        # Safe Load Bin Edges
+        bin_edges = cfg.get("bin_edges")
+        if not bin_edges:
+            print("WARNING: bin_edges not in config. Using DEFAULT.")
+            bin_edges = (
+                0.010951, 0.090349, 0.238193, 0.443532, 0.722793, 1.070500,
+                1.612594, 2.409309, 3.841205, 7.000684, 30.997947
+            )
+        loss_fn = LogNormalBasisHazardLoss(centers=list(bin_edges))
+        n_dim = len(bin_edges)
 
-    if loss_type == "exponential":
-        n_dim = 1
-        loss_fn = ExponentialNLLLoss().to(args.device)
-    elif loss_type == "lognormal":
-        # Fallback bin_edges if not in config (train.py usually hardcodes them)
-        bin_edges = cfg_dict.get("bin_edges", (
-            0.010951, 0.090349, 0.238193, 0.443532, 0.722793, 1.070500,
-            1.612594, 2.409309, 3.841205, 7.000684, 30.997947
-        ))
-        centers = list(bin_edges)
-        n_dim = len(centers)
-        loss_fn = LogNormalBasisHazardLoss(centers=centers).to(args.device)
+    loss_fn.to(args.device)
 
-    model_type = cfg_dict.get("model_type", "delphifork")
-    n_embd = cfg_dict.get("n_embd", 120)
-    pdrop = cfg_dict.get("pdrop", 0.0)  # Load pdrop
+    # Initialize Model Structure
+    # Assuming 'dataset' parameters are needed for init, usually stored in config
+    # or we infer from a dummy dataset load.
+    # For robust loading, we load dataset first.
+    data_prefix = cfg.get("data_prefix", "ukb")
+    cov_list = None if cfg.get("full_cov") else ["bmi", "smoking", "alcohol"]
+
+    dataset = HealthDataset(data_prefix=data_prefix, covariate_list=cov_list)
+
+    model_type = cfg.get("model_type", "delphifork")
+    n_embd = cfg.get("n_embd", 120)
+    pdrop = cfg.get("pdrop", 0.0)
 
     if model_type == "delphifork":
         model = DelphiFork(
@@ -607,10 +675,10 @@ if __name__ == "__main__":
             n_cate=dataset.n_cate,
             cate_dims=dataset.cate_dims,
             n_embd=n_embd,
-            n_layer=cfg_dict.get("n_layer", 12),
-            n_head=cfg_dict.get("n_head", 12),
+            n_layer=cfg.get("n_layer", 12),
+            n_head=cfg.get("n_head", 12),
             pdrop=pdrop,
-            age_encoder_type=cfg_dict.get("age_encoder", "sinusoidal"),
+            age_encoder_type=cfg.get("age_encoder", "sinusoidal"),
             n_dim=n_dim
         )
     elif model_type == "sapdelphi":
@@ -621,34 +689,51 @@ if __name__ == "__main__":
             n_cate=dataset.n_cate,
             cate_dims=dataset.cate_dims,
             n_embd=n_embd,
-            n_layer=cfg_dict.get("n_layer", 12),
-            n_head=cfg_dict.get("n_head", 12),
+            n_layer=cfg.get("n_layer", 12),
+            n_head=cfg.get("n_head", 12),
             pdrop=pdrop,
-            age_encoder_type=cfg_dict.get("age_encoder", "sinusoidal"),
+            age_encoder_type=cfg.get("age_encoder", "sinusoidal"),
             n_dim=n_dim,
-            pretrained_weights_path=cfg_dict.get("pretrained_weights_path"),
+            pretrained_weights_path=cfg.get("pretrained_weights_path"),
         )
 
     model.to(args.device)
 
-    best_path = os.path.join(args.run_dir, "best_model.pt")
-    if not os.path.exists(best_path):
-        best_path = os.path.join(args.run_dir, "last_model.pt")
+    # Load Weights
+    ckpt_path = os.path.join(args.run_dir, "best_model.pt")
+    if not os.path.exists(ckpt_path):
+        ckpt_path = os.path.join(args.run_dir, "last_model.pt")
 
-    print(f"Loading weights from {best_path}...")
-    ckpt = torch.load(best_path, map_location=args.device)
+    print(f"Loading weights: {ckpt_path}")
+    state = torch.load(ckpt_path, map_location=args.device)
+    model.load_state_dict(state['model_state_dict'])
 
-    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        model.load_state_dict(ckpt["model_state_dict"])
-        if "criterion_state_dict" in ckpt and loss_fn is not None:
-            loss_fn.load_state_dict(ckpt["criterion_state_dict"])
-    else:
-        model.load_state_dict(ckpt)
+    # Also load criterion state if available (for log_sigma in LogNormal)
+    if 'criterion_state_dict' in state and loss_fn is not None:
+        loss_fn.load_state_dict(state['criterion_state_dict'])
+        print("Loaded criterion state (sigma).")
 
     model.eval()
+
+    # Split Test Set
+    n_total = len(dataset)
+    train_ratio = cfg.get("train_ratio", 0.7)
+    val_ratio = cfg.get("val_ratio", 0.15)
+    test_ratio = 1.0 - train_ratio - val_ratio
+
+    tr_len = int(n_total * train_ratio)
+    va_len = int(n_total * val_ratio)
+    te_len = n_total - tr_len - va_len
+
+    _, _, test_dataset = random_split(
+        dataset, [tr_len, va_len, te_len],
+        generator=torch.Generator().manual_seed(cfg.get("random_seed", 42))
+    )
+
     disease_map = load_labels()
 
-    run_stratified_evaluation(eval_dataset, model, loss_fn, args, disease_map)
-    run_landmark_analysis(eval_dataset, model, loss_fn, args)
+    # Run Experiments
+    run_stratified_evaluation(test_dataset, model, loss_fn, args, disease_map)
+    run_landmark_analysis(test_dataset, model, loss_fn, args)
 
-    print("Evaluation Complete.")
+    print("\nAll Evaluations Completed Successfully.")
