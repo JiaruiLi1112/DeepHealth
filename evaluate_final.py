@@ -431,8 +431,9 @@ def run_stratified_evaluation(dataset, model, loss_fn, args, disease_map):
         results.append(res_row)
 
     df_res = pd.DataFrame(results)
-    df_res.to_csv("results_exp1_stratified.csv", index=False)
-    print("Saved results_exp1_stratified.csv")
+    out_path = os.path.join(args.run_dir, "results_exp1_stratified.csv")
+    df_res.to_csv(out_path, index=False)
+    print(f"Saved {out_path}")
 
 
 def run_landmark_analysis(dataset, model, loss_fn, args):
@@ -611,11 +612,13 @@ def run_landmark_analysis(dataset, model, loss_fn, args):
 
     df_cal = pd.DataFrame([calibration_data[h] for h in horizons])
     df_cal['Horizon'] = horizons
-    df_cal.to_csv("results_exp2_calibration.csv", index=False)
+    cal_path = os.path.join(args.run_dir, "results_exp2_calibration.csv")
+    df_cal.to_csv(cal_path, index=False)
 
     df_rank = pd.DataFrame([ranking_data[h] for h in horizons])
-    df_rank.to_csv("results_exp2_ranking.csv", index=False)
-    print("Saved results_exp2_ranking.csv")
+    rank_path = os.path.join(args.run_dir, "results_exp2_ranking.csv")
+    df_rank.to_csv(rank_path, index=False)
+    print(f"Saved {rank_path}")
 
 
 if __name__ == "__main__":
