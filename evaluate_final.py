@@ -43,7 +43,8 @@ def load_labels(labels_file="labels.csv"):
 
 def calculate_conditional_risk(theta, t_start, t_end, loss_type, loss_fn=None):
     """
-    Calculate P(t_start < T <= t_end | T > t_start).
+    Calculate P(t_start < T <= t_end | T > t_start) using CDF strictly.
+    Formula: (F(t_end) - F(t_start)) / (1 - F(t_start))
     """
     device = theta.device
 
@@ -53,6 +54,19 @@ def calculate_conditional_risk(theta, t_start, t_end, loss_type, loss_fn=None):
             logits = logits.squeeze(-1)
 
         lambdas = F.softplus(logits)  # (B, K)
+
+        # Exponential CDF: F(t) = 1 - exp(-lambda * t)
+        # We need to broadcast t_start/t_end to (B, K) if they are scalars
+        # But actually we can just work with the exponents.
+
+        # F(te) = 1 - exp(-lambda * te)
+        # F(ts) = 1 - exp(-lambda * ts)
+        # Numerator = (1 - exp(-lambda * te)) - (1 - exp(-lambda * ts))
+        #           = exp(-lambda * ts) - exp(-lambda * te)
+        # Denom = 1 - (1 - exp(-lambda * ts)) = exp(-lambda * ts)
+        # Ratio = 1 - exp(-lambda * te) / exp(-lambda * ts) = 1 - exp(-lambda*(te-ts))
+
+        # The user requested using F explicitly.
         dt = t_end - t_start
         risk = 1.0 - torch.exp(-lambdas * dt)
         return risk
@@ -64,13 +78,14 @@ def calculate_conditional_risk(theta, t_start, t_end, loss_type, loss_fn=None):
 
         coeffs = theta  # (B, K, n_basis)
 
-        def compute_H(t_vals):
+        def compute_F(t_vals):
             # t_vals: (B,) or scalar broadcasted
             if isinstance(t_vals, float):
                 t_vals = torch.full((coeffs.shape[0],), t_vals, device=device)
 
             t = torch.clamp(t_vals, min=loss_fn.eps)
 
+            # Integration for H(t)
             x_nodes, w = _gauss_legendre_16(
                 device=device, dtype=coeffs.dtype)  # (16,)
 
@@ -85,14 +100,26 @@ def calculate_conditional_risk(theta, t_start, t_end, loss_type, loss_fn=None):
             log_hazards_u = torch.clamp(log_hazards_u, max=20.0)
             hazards_u = torch.exp(log_hazards_u)
 
-            H = torch.sum(hazards_u * weights.unsqueeze(1), dim=2)
-            return H
+            H = torch.sum(hazards_u * weights.unsqueeze(1), dim=2)  # (B, K)
 
-        H_start = compute_H(t_start)
-        H_end = compute_H(t_end)
+            # F(t) = 1 - exp(-H(t))
+            F = 1.0 - torch.exp(-H)
+            return F
 
-        diff_H = torch.clamp(H_end - H_start, min=0.0)
-        risk = 1.0 - torch.exp(-diff_H)
+        F_start = compute_F(t_start)
+        F_end = compute_F(t_end)
+
+        # Formula: (F(te) - F(ts)) / (1 - F(ts))
+        # Clamp F_start < 1.0 slightly to avoid division by zero
+        F_start = torch.clamp(F_start, max=1.0 - 1e-7)
+
+        # Numerator
+        num = F_end - F_start
+        num = torch.clamp(num, min=0.0)  # Ensure non-negative probability
+
+        denom = 1.0 - F_start
+
+        risk = num / denom
         return risk
 
     else:
@@ -109,6 +136,16 @@ def run_stratified_evaluation(dataset, model, loss_fn, args, disease_map):
     age_buckets = [40, 45, 50, 55, 60, 65, 70, 75, 80]
     results = []
 
+    # Identify Death Code from map
+    # Reverse map: Name -> ID
+    death_id = None
+    for k, v in disease_map.items():
+        if v == "Death":
+            death_id = k
+            break
+
+    print(f"Death ID identified as: {death_id}")
+
     # Pre-select patients for efficiency
     patient_meta = []
     for i in range(len(dataset)):
@@ -116,9 +153,19 @@ def run_stratified_evaluation(dataset, model, loss_fn, args, disease_map):
         events = sorted(dataset.patient_events[pid], key=lambda x: x[0])
         ts = [x[0]/365.25 for x in events]
         es = [x[1] for x in events]
+
+        death_time = None
+        if death_id is not None:
+            # Check if death event exists
+            for t_val, e_code in zip(ts, es):
+                if e_code == death_id:
+                    death_time = t_val
+                    break
+
         patient_meta.append({
             'idx': i,
             'max_time': ts[-1] if ts else 0,
+            'death_time': death_time,
             'events': list(zip(ts, es))
         })
 
@@ -176,7 +223,39 @@ def run_stratified_evaluation(dataset, model, loss_fn, args, disease_map):
 
         eligible_indices = []
         for pm in patient_meta:
-            if pm['max_time'] >= t_start:
+            # Strict Filtering:
+            # 1. Observed until end of window (max_time >= t_target_end)
+            # 2. OR Died strictly within the window (t_target_start < death_time <= t_target_end)
+            # Note: If died < t_target_start, they are not at risk at t_start?
+            # Actually, standard survival at age A requires being alive at A.
+            # So if death_time <= t_start, they are already dead -> Exclude.
+            # If death_time > t_target_end, they are covered by max_time >= t_target_end check.
+
+            # First check: Alive at t_start?
+            if pm['death_time'] is not None and pm['death_time'] <= t_start:
+                continue
+
+            # Then check followup sufficiency
+            is_followed_up = pm['max_time'] >= t_target_end
+            is_dead_in_window = (pm['death_time'] is not None and
+                                 pm['death_time'] > t_start and
+                                 pm['death_time'] <= t_target_end)
+
+            # Wait, if death_time is in (t_start, t_target_start], does that count?
+            # We are predicting "disease in (A+0.5, A+5]".
+            # If they die at A+0.2, they can't get disease in window -> Outcome 0 (valid).
+            # So strictly: death > t_start is sufficient to close the "Outcome 0" case?
+            # Yes, if they die, the risk of disease is 0 (competing risk).
+            # So as long as death_time > t_start, they are valid candidates with outcome 0.
+            # But we need to distinguish "Dropout" (censored) from "Death" (valid 0).
+            # Code below checks "is_dead_in_window" relative to prediction horizon end.
+            # If they die at t_start + 0.2 (before window start), they are a valid 0 for the window [A+0.5, A+5].
+            # So simple logic: EITHER followed up >= t_target_end OR Died after t_start.
+
+            # Refined:
+            # 1. Must be alive at t_start.
+            # 2. Must be fully observed until t_target_end OR have a terminating event (Death) after t_start.
+            if is_followed_up or (pm['death_time'] is not None and pm['death_time'] > t_start):
                 eligible_indices.append(pm['idx'])
 
         if not eligible_indices:
@@ -215,10 +294,9 @@ def run_stratified_evaluation(dataset, model, loss_fn, args, disease_map):
                     t_trunc = t_seq[mask]
                     e_trunc = e_seq[mask]
 
-                    t_trunc = torch.cat([t_trunc, torch.tensor(
-                        [limit_days],  dtype=t_trunc.dtype)])
-                    e_trunc = torch.cat(
-                        [e_trunc, torch.tensor([1], dtype=e_trunc.dtype)])
+                    # Removed artificial appending of DOA token per user request.
+                    # t_trunc = torch.cat([t_trunc, torch.tensor([limit_days],  dtype=t_trunc.dtype)])
+                    # e_trunc = torch.cat([e_trunc, torch.tensor([1], dtype=e_trunc.dtype)])
 
                     new_event_seqs.append(e_trunc)
                     new_time_seqs.append(t_trunc)
@@ -259,10 +337,26 @@ def run_stratified_evaluation(dataset, model, loss_fn, args, disease_map):
                 n_dim = model.n_dim
                 theta = theta.view(B_curr, dataset.n_disease, n_dim)
 
+                # Correct logic for Time Anchor Mismatch:
+                # The model predicts risk starting from t_last (last event time).
+                # We want risk in window [Anchor+0.5, Anchor+5.0].
+                # So relative to t_last, the window is [Anchor-t_last + 0.5, Anchor-t_last + 5.0].
+
+                # Get last event time for each patient in batch (in days)
+                last_times_days = torch.tensor(
+                    [t[-1] for t in new_time_seqs], device=args.device)
+                anchor_days = limit_days
+                gap_days = anchor_days - last_times_days
+                gap_years = gap_days / 365.25
+
+                # Compute risk window relative to last event
+                risk_t_start = gap_years + 0.5
+                risk_t_end = gap_years + 5.0
+
                 risks = calculate_conditional_risk(
                     theta,
-                    t_start=0.5,
-                    t_end=5.0,
+                    t_start=risk_t_start,
+                    t_end=risk_t_end,
                     loss_type=loss_type,
                     loss_fn=loss_fn
                 )
@@ -367,10 +461,10 @@ def run_landmark_analysis(dataset, model, loss_fn, args):
                 t_trunc = t_seq[mask]
                 e_trunc = e_seq[mask]
 
-                t_trunc = torch.cat([t_trunc, torch.tensor(
-                    [limit_days],  dtype=t_trunc.dtype)])
-                e_trunc = torch.cat(
-                    [e_trunc, torch.tensor([1], dtype=e_trunc.dtype)])
+                # Removed artificial appending of DOA per user request regarding Experiment 1.
+                # Assuming Experiment 2 should follow same rigorous truncation.
+                # t_trunc = torch.cat([t_trunc, torch.tensor([limit_days],  dtype=t_trunc.dtype)])
+                # e_trunc = torch.cat([e_trunc, torch.tensor([1], dtype=e_trunc.dtype)])
 
                 new_event_seqs.append(e_trunc)
                 new_time_seqs.append(t_trunc)
@@ -404,9 +498,27 @@ def run_landmark_analysis(dataset, model, loss_fn, args):
                           cate_in, b_prev=b_prev, t_prev=t_prev)
             theta = theta.view(B_curr, dataset.n_disease, model.n_dim)
 
+            # Correct logic for Time Anchor Mismatch:
+            # Anchor is fixed at limit_days (Age 60).
+            # Gap = 60 - Last_Event_Time.
+            # Window starts at Gap + 0, ends at Gap + Horizon.
+
+            last_times_days = torch.tensor(
+                [t[-1] for t in new_time_seqs], device=args.device)
+            gap_days = limit_days - last_times_days
+            gap_years = gap_days / 365.25
+
             for h in horizons:
+                risk_t_start = gap_years + 0.0
+                risk_t_end = gap_years + float(h)
+
                 risks = calculate_conditional_risk(
-                    theta, 0.0, float(h), loss_type, loss_fn)
+                    theta,
+                    t_start=risk_t_start,
+                    t_end=risk_t_end,
+                    loss_type=loss_type,
+                    loss_fn=loss_fn)
+
                 all_pred_risks[h].append(risks.cpu().numpy())
                 all_true_outcomes[h].append(np.array(batch_targets[h]))
 
